@@ -14,7 +14,6 @@ import Foundation
 import AppKit
 import PostHog
 
-@MainActor
 final class AnalyticsService {
     static let shared = AnalyticsService()
 
@@ -22,6 +21,7 @@ final class AnalyticsService {
 
     private let optInKey = "analyticsOptIn"
     private let distinctIdKeychainKey = "analyticsDistinctId"
+    private let throttleLock = NSLock()
     private var throttles: [String: Date] = [:]
 
     var isOptedIn: Bool {
@@ -43,15 +43,18 @@ final class AnalyticsService {
         config.captureApplicationLifecycleEvents = false
         PostHogSDK.shared.setup(config)
 
-        // Identity
-        let id = ensureDistinctId()
-        PostHogSDK.shared.identify(id)
+        // Identity - run on background thread to avoid blocking app launch
+        // PostHog's identify() triggers synchronous disk I/O and XPC calls
+        Task.detached(priority: .utility) { [self] in
+            let id = self.ensureDistinctId()
+            PostHogSDK.shared.identify(id)
+        }
 
         // Super properties at launch
         registerInitialSuperProperties()
 
         // Person properties via $set / $set_once
-        var set: [String: Any] = [
+        let set: [String: Any] = [
             "analytics_opt_in": isOptedIn
         ]
         var payload: [String: Any] = ["$set": sanitize(set)]
@@ -73,13 +76,22 @@ final class AnalyticsService {
     }
 
     func setOptIn(_ enabled: Bool) {
+        if isOptedIn != enabled {
+            let payload: [String: Any] = ["$set": sanitize(["analytics_opt_in": enabled])]
+            Task.detached(priority: .utility) {
+                PostHogSDK.shared.capture("person_props_updated", properties: payload)
+                PostHogSDK.shared.capture("analytics_opt_in_changed", properties: ["enabled": enabled])
+            }
+        }
         isOptedIn = enabled
-        setPersonProperties(["analytics_opt_in": enabled])
     }
 
     func capture(_ name: String, _ props: [String: Any] = [:]) {
         guard isOptedIn else { return }
-        PostHogSDK.shared.capture(name, properties: sanitize(props))
+        let sanitized = sanitize(props)
+        Task.detached(priority: .utility) {
+            PostHogSDK.shared.capture(name, properties: sanitized)
+        }
     }
 
     func screen(_ name: String, _ props: [String: Any] = [:]) {
@@ -89,7 +101,9 @@ final class AnalyticsService {
 
     func identify(_ distinctId: String, properties: [String: Any] = [:]) {
         guard isOptedIn else { return }
-        PostHogSDK.shared.identify(distinctId)
+        Task.detached(priority: .utility) {
+            PostHogSDK.shared.identify(distinctId)
+        }
         if !properties.isEmpty {
             setPersonProperties(properties)
         }
@@ -97,22 +111,32 @@ final class AnalyticsService {
 
     func alias(_ aliasId: String) {
         guard isOptedIn else { return }
-        PostHogSDK.shared.alias(aliasId)
+        Task.detached(priority: .utility) {
+            PostHogSDK.shared.alias(aliasId)
+        }
     }
 
     func registerSuperProperties(_ props: [String: Any]) {
         guard isOptedIn else { return }
-        PostHogSDK.shared.register(sanitize(props))
+        let sanitized = sanitize(props)
+        Task.detached(priority: .utility) {
+            PostHogSDK.shared.register(sanitized)
+        }
     }
 
     func setPersonProperties(_ props: [String: Any]) {
         guard isOptedIn else { return }
         let payload: [String: Any] = ["$set": sanitize(props)]
-        PostHogSDK.shared.capture("person_props_updated", properties: payload)
+        Task.detached(priority: .utility) {
+            PostHogSDK.shared.capture("person_props_updated", properties: payload)
+        }
     }
 
     func throttled(_ key: String, minInterval: TimeInterval, action: () -> Void) {
         let now = Date()
+        throttleLock.lock()
+        defer { throttleLock.unlock() }
+
         if let last = throttles[key], now.timeIntervalSince(last) < minInterval { return }
         throttles[key] = now
         action()
@@ -141,6 +165,31 @@ final class AnalyticsService {
         case ..<0.75: return "50-75%"
         default: return "75-100%"
         }
+    }
+
+    /// Track LLM validation failures (time coverage, duration, parse errors)
+    func captureValidationFailure(
+        provider: String,
+        operation: String,
+        validationType: String,
+        attempt: Int,
+        model: String?,
+        batchId: Int64?,
+        errorDetail: String?
+    ) {
+        var props: [String: Any] = [
+            "provider": provider,
+            "operation": operation,
+            "validation_type": validationType,
+            "attempt": attempt
+        ]
+        if let model = model { props["model"] = model }
+        if let batchId = batchId { props["batch_id"] = batchId }
+        if let errorDetail = errorDetail {
+            // Truncate long error details to avoid bloating events
+            props["error_detail"] = String(errorDetail.prefix(500))
+        }
+        capture("llm_validation_failed", props)
     }
 
     func dayString(_ date: Date) -> String {

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/macOS-13%2B-000?logo=apple" alt="Platform: macOS 13+">
   <img src="https://img.shields.io/badge/SwiftUI-✓-orange" alt="SwiftUI">
   <img src="https://img.shields.io/badge/Updates-Sparkle-informational" alt="Updates: Sparkle">
-  <img src="https://img.shields.io/badge/AI-Gemini%20or%20Local-blue" alt="AI: Gemini / Local">
+  <img src="https://img.shields.io/badge/AI-Gemini%20%7C%20Local%20%7C%20ChatGPT%2FClaude-blue" alt="AI: Gemini | Local | ChatGPT/Claude">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License: MIT">
 </div>
 
@@ -34,6 +34,7 @@
   <a href="#how-it-works">How it works</a> •
   <a href="#installation">Installation</a> •
   <a href="#data--privacy">Data & Privacy</a> •
+  <a href="#automation">Automation</a> •
   <a href="#debug--developer-tools">Debug & Developer Tools</a> •
   <a href="#auto-updates-sparkle">Auto‑updates</a> •
   <a href="#contributing">Contributing</a>
@@ -46,7 +47,7 @@
 Dayflow is a **native macOS app** (SwiftUI) that records your screen at **1 FPS**, analyzes it **every 15 minutes** with AI, and generates a **timeline** of your activities with summaries. 
 It's lightweight (25MB app size) and uses ~100MB of RAM and <1% cpu. 
 
-> _Privacy‑minded by design_: You choose your AI provider. Use **Gemini** (bring your own API key) or **local models** (Ollama / LM Studio). See **Data & Privacy** for details.
+> _Privacy‑minded by design_: You choose your AI provider. Use **Gemini** (bring your own API key), **local models** (Ollama / LM Studio), or **ChatGPT/Claude** (requires paid subscription). See **Data & Privacy** for details.
 
 
 ## Why I built Dayflow
@@ -64,10 +65,27 @@ Dayflow stands for ownership and privacy by default. You control the data, you c
 - **1 FPS recording** - minimal CPU/storage impact.
 - **15-minute analysis intervals** for timely updates.
 - **Watch timelapses of your day**.
-- **Auto storage cleanup** - removes old recordings after 3 days.
+- **Auto storage cleanup** - configurable storage limits.
 - **Distraction highlights** to see what pulled you off‑task.
+- **Timeline export** — export your timeline as Markdown for any date range.
 - **Native UX** built with **SwiftUI**.
 - **Auto‑updates** with **Sparkle** (daily check + background download).
+
+### Daily Journal `BETA`
+
+Set intentions, reflect on your day, and get AI-generated summaries of your activity.
+
+<div align="center">
+  <img src="docs/images/JournalPreview.png" alt="Dayflow journal preview" width="800">
+</div>
+
+- **Morning intentions** — plan what you want to accomplish.
+- **Evening reflections** — review how your day actually went.
+- **AI summaries** — get auto-generated insights from your timeline.
+- **Scheduled reminders** — configurable notifications for intentions and reflections.
+- **Weekly view** — see patterns across your week.
+
+> **Note:** Journal is currently in beta with limited access. Enter your access code in the app to unlock it.
 
 ### Coming soon
 
@@ -77,19 +95,13 @@ Dayflow stands for ownership and privacy by default. You control the data, you c
     <img src="docs/images/DashboardPreview.png" alt="Dayflow dashboard preview" width="800">
   </div>
 
-- **Daily journal** — review the highlights Dayflow captured, reflect with guided prompts, and drop screenshots or notes alongside your generated timeline.
-
-  <div align="center">
-    <img src="docs/images/JournalPreview.png" alt="Dayflow journal preview" width="800">
-  </div>
-
 ## How it works
 
 1) **Capture** — Records screen at 1 FPS in 15-second chunks.
 2) **Analyze** — Every 15 minutes, sends recent footage to AI.
 3) **Generate** — AI creates timeline cards with activity summaries.
 4) **Display** — Shows your day as a visual timeline.
-5) **Cleanup** — Auto-deletes recordings older than 3 days.
+5) **Cleanup** — Auto-manages storage based on your configured limits (1GB–20GB or unlimited).
 
 ### AI Processing Pipeline
 
@@ -107,23 +119,32 @@ flowchart LR
         LV[Video] --> LE[Extract 30 frames] --> LD[30 descriptions<br/>30 LLM calls] --> LM[Merge<br/>1 call] --> LT[Title<br/>1 call] --> LC[Merge Check<br/>1 call] --> LMC[Merge Cards<br/>1 call] --> LD2[Done]
     end
 
+    subgraph ChatCLI["ChatGPT/Claude Flow: 4-6 LLM Calls"]
+        direction LR
+        CV[Video] --> CE[Extract frames<br/>every 60s] --> CB[Batch describe<br/>10 frames/call] --> CM[Merge segments<br/>1 call] --> CC[Generate Cards<br/>1 call] --> CD[Done]
+    end
+
     %% Styling
     classDef geminiFlow fill:#e8f5e8,stroke:#4caf50,stroke-width:2px
     classDef localFlow fill:#fff8e1,stroke:#ff9800,stroke-width:2px
+    classDef chatcliFlow fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
     classDef geminiStep fill:#4caf50,color:#fff
     classDef localStep fill:#ff9800,color:#fff
+    classDef chatcliStep fill:#1976d2,color:#fff
     classDef processing fill:#f5f5f5,stroke:#666
     classDef result fill:#e3f2fd,stroke:#1976d2
 
     class Gemini geminiFlow
     class Local localFlow
+    class ChatCLI chatcliFlow
     class GU,GC geminiStep
     class LD,LM,LT,LC,LMC localStep
-    class GV,LV,LE processing
-    class GD,LD2 result
+    class CB,CM,CC chatcliStep
+    class GV,LV,LE,CV,CE processing
+    class GD,LD2,CD result
 ```
 
-**Gemini** leverages native video understanding for direct analysis, while **Local models** reconstruct understanding from individual frame descriptions - resulting in dramatically different processing complexity.
+**Gemini** leverages native video understanding for direct analysis. **Local models** reconstruct understanding from individual frame descriptions. **ChatGPT/Claude** uses CLI tools to batch-process extracted frames with frontier reasoning models—balancing quality and efficiency.
 
 
 ---
@@ -173,6 +194,14 @@ open Dayflow.xcodeproj
 # In Xcode: select the Dayflow target, configure signing if needed, then Run.
 ```
 
+### Homebrew
+
+If you are using [Homebrew](https://brew.sh/), you can install [Dayflow](https://formulae.brew.sh/cask/dayflow) with:
+
+```bash
+$ brew install --cask dayflow
+```
+
 ---
 
 ## Data & Privacy
@@ -180,17 +209,19 @@ open Dayflow.xcodeproj
 This section explains **what Dayflow stores locally**, **what leaves your machine**, and **how provider choices affect privacy**.
 
 ### Data locations (on your Mac)
-- **App support folder:** `~/Library/Application Support/Dayflow/`
-- **Recordings (video chunks):** `~/Library/Application Support/Dayflow/recordings/`
-- **Local database:** `~/Library/Application Support/Dayflow/chunks.sqlite`
-- **Recording details:** 1 FPS capture, analyzed every 15 minutes, 3-day retention
-- **Purge / reset tip:** Quit Dayflow. Then delete the entire `~/Library/Application Support/Dayflow/` folder to remove recordings and analysis artifacts. Relaunch to start fresh.
 
-> These paths are created by the app at first run. If you package Dayflow differently or run in a sandbox, paths may vary slightly.
+All Dayflow data is stored in:
+`~/Library/Application Support/Dayflow/`
+
+- **Recordings (video chunks):** `Dayflow/recordings/` (or choose "Open Recordings..." from the Dayflow Taskbar Icon Menu)
+- **Local database:** `Dayflow/chunks.sqlite`
+- **Recording details:** 1 FPS capture, analyzed every 15 minutes, configurable storage limits
+- **Purge / reset tip:** Quit Dayflow. Then delete the entire `Dayflow/` folder to remove recordings and analysis artifacts. Relaunch to start fresh.
 
 ### Processing modes & providers
-- **Gemini (cloud, BYO key)** — Dayflow sends batch payloads to **Google’s Gemini API** for analysis.
+- **Gemini (cloud, BYO key)** — Dayflow sends batch payloads to **Google's Gemini API** for analysis.
 - **Local models (Ollama / LM Studio)** — Processing stays **on‑device**; Dayflow talks to a **local server** you run.
+- **ChatGPT / Claude (CLI-based, paid plan required)** — Dayflow drives the **Codex CLI** (ChatGPT) or **Claude Code CLI** directly on your Mac. **Requires an active ChatGPT Plus/Pro or Claude Pro subscription.** Uses frontier reasoning models for best-in-class narrative quality.
 
 ### TL;DR: Gemini data handling (my reading of Google’s ToS)
 - **Short answer: There is a way to prevent Google from training on your data.** If you **enable Cloud Billing** on **at least one** Gemini API project, Google treats **all of your Gemini API and Google AI Studio usage** under the **“Paid Services”** data‑use rules — **even when you’re using unpaid/free quota**. Under Paid Services, **Google does not use your prompts/responses to improve Google products/models**.  
@@ -204,14 +235,21 @@ This section explains **what Dayflow stores locally**, **what leaves your machin
 - **Free workaround:** _“Make one project paid, keep using a free key elsewhere to get the best of both worlds.”_ The **Terms** imply **account‑level** coverage once any billing account is activated, but the **Apps** nuance above may limit this in specific UI contexts. **Treat this as an interpretation, not legal advice.**
 
 ### Local mode: privacy & trade‑offs
-- **Privacy:** With **Ollama/LM Studio**, prompts and model inference run on your machine. LM Studio documents full **offline** operation once models are downloaded.  
-- **Quality/latency:** Local open models are improving but **can underperform** cloud models on complex summarization.  
-- **Power/battery:** Local inference is **GPU‑heavy** on Apple Silicon and will drain battery faster; prefer **plugged‑in** sessions for long captures.  
+- **Privacy:** With **Ollama/LM Studio**, prompts and model inference run on your machine. LM Studio documents full **offline** operation once models are downloaded.
+- **Quality/latency:** Local open models are improving but **can underperform** cloud models on complex summarization.
+- **Power/battery:** Local inference is **GPU‑heavy** on Apple Silicon and will drain battery faster; prefer **plugged‑in** sessions for long captures.
 - **Future:** We may explore **fine‑tuning** or distilling a local model for better timeline summaries.
 
-References:  
-- LM Studio offline: https://lmstudio.ai/docs/app/offline  
+References:
+- LM Studio offline: https://lmstudio.ai/docs/app/offline
 - Ollama GPU acceleration (Metal on Apple): https://github.com/ollama/ollama/blob/main/docs/gpu.md
+
+### ChatGPT/Claude mode: privacy & trade‑offs
+- **Privacy:** Your screen data is processed by OpenAI (ChatGPT) or Anthropic (Claude) depending on which CLI you configure. Review their respective privacy policies.
+- **Quality:** Frontier reasoning models provide the highest quality narratives and summaries.
+- **Subscription required:** You **must have an active paid subscription** (ChatGPT Plus/Pro at $20+/month, or Claude Pro at $20/month). The CLI tools authenticate through your existing subscription.
+- **Setup:** Requires installing the [Codex CLI](https://github.com/openai/codex) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and staying signed in.
+- **Internet:** Requires an active internet connection (no offline mode).
 
 ### Permissions (macOS)
 To record your screen, Dayflow requires the **Screen & System Audio Recording** permission. Review or change later at:  
@@ -223,12 +261,30 @@ Apple’s docs: https://support.apple.com/guide/mac-help/control-access-screen-s
 ## Configuration
 
 - **AI Provider**
-  - Choose **Gemini** (set `GEMINI_API_KEY`) or **Local** (Ollama/LM Studio endpoint).  
+  - Choose **Gemini** (set API key), **Local** (Ollama/LM Studio), or **ChatGPT/Claude** (install CLI + paid subscription).
   - For Gemini keys: https://ai.google.dev/gemini-api/docs/api-key
+  - For ChatGPT: Install [Codex CLI](https://github.com/openai/codex), sign in with your **ChatGPT Plus/Pro** account
+  - For Claude: Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code), sign in with your **Claude Pro** account
 - **Capture settings**
   - Start/stop capture from the main UI. Use **Debug** to verify batch contents.
 - **Data locations**
   - See **Data & Privacy** for exact paths and a purge tip.
+
+---
+
+## Automation
+
+Dayflow registers a `dayflow://` URL scheme so you can trigger common actions from Shortcuts, hotkey launchers, or scripts.
+
+**Supported URLs**
+- `dayflow://start-recording` — enable capture (no-op if already recording)
+- `dayflow://stop-recording` — pause capture (no-op if already paused)
+
+**Quick checks**
+- From Terminal: `open dayflow://start-recording` or `open dayflow://stop-recording`
+- In Shortcuts: add an **Open URLs** action with either link above
+
+Deeplink-triggered state changes are logged as `reason: "deeplink"` in analytics so you can distinguish automations from manual toggles.
 
 ---
 
@@ -266,8 +322,8 @@ Dayflow/
 ## Roadmap
 
 - [ ] V1 of the Dashboard (track answers to custom questions)
-- [ ] V1 of the daily journal
-- [ ] Fine tuning a small VLM 
+- [x] V1 of the daily journal — _now in beta!_
+- [ ] Fine-tuning a small VLM for improved local model quality 
 
 ---
 
@@ -289,3 +345,4 @@ Software is provided “AS IS”, without warranty of any kind.
 - [Sparkle](https://github.com/sparkle-project/Sparkle) for battle‑tested macOS updates.
 - [Google AI Gemini API](https://ai.google.dev/gemini-api/docs) for analysis.
 - [Ollama](https://ollama.com/) and [LM Studio](https://lmstudio.ai/) for local model support.
+- [OpenAI Codex CLI](https://github.com/openai/codex) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) for CLI-based inference.

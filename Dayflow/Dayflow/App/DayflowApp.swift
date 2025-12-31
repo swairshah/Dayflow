@@ -2,18 +2,77 @@
 //  DayflowApp.swift
 //  Dayflow
 //
-//  Created by Jerry Liu on 4/20/25.
-//
 
 import SwiftUI
 import Sparkle
 
 struct AppRootView: View {
     @EnvironmentObject private var categoryStore: CategoryStore
+    @State private var whatsNewNote: ReleaseNote? = nil
+    @State private var activeWhatsNewVersion: String? = nil
+    @State private var shouldMarkWhatsNewSeen = false
+
     var body: some View {
         MainView()
             .environmentObject(AppState.shared)
             .environmentObject(categoryStore)
+            .onAppear {
+                guard whatsNewNote == nil else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if let note = WhatsNewConfiguration.pendingReleaseForCurrentBuild() {
+                        whatsNewNote = note
+                        activeWhatsNewVersion = note.version
+                        shouldMarkWhatsNewSeen = true
+                    }
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showWhatsNew)) { _ in
+                guard let release = WhatsNewConfiguration.latestRelease() else { return }
+                whatsNewNote = release
+                activeWhatsNewVersion = release.version
+                shouldMarkWhatsNewSeen = release.version == currentAppVersion
+
+                // Analytics: track manual view
+                AnalyticsService.shared.capture("whats_new_viewed_manual", [
+                    "version": release.version
+                ])
+            }
+            .sheet(item: $whatsNewNote, onDismiss: handleWhatsNewDismissed) { note in
+                ZStack {
+                    // Backdrop
+                    Color.black.opacity(0.4)
+                        .ignoresSafeArea()
+
+                    WhatsNewView(releaseNote: note) {
+                        closeWhatsNew()
+                    }
+                }
+            }
+    }
+
+    private func closeWhatsNew() {
+        whatsNewNote = nil
+    }
+
+    private func handleWhatsNewDismissed() {
+                guard let version = activeWhatsNewVersion else { return }
+        if shouldMarkWhatsNewSeen {
+            WhatsNewConfiguration.markReleaseAsSeen(version: version)
+            AnalyticsService.shared.capture("whats_new_viewed", [
+                "version": version,
+                "source": "auto"
+            ])
+        }
+        AnalyticsService.shared.capture("whats_new_viewed", [
+            "version": version,
+            "source": "manual"
+        ])
+        activeWhatsNewVersion = nil
+        shouldMarkWhatsNewSeen = false
+    }
+
+    private var currentAppVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
     }
 }
 
@@ -22,11 +81,13 @@ struct DayflowApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @AppStorage("didOnboard") private var didOnboard = false
     @AppStorage("useBlankUI") private var useBlankUI = false
+    @AppStorage("hasCompletedJournalOnboarding") private var hasCompletedJournalOnboarding = false
     @State private var showVideoLaunch = true
     @State private var contentOpacity = 0.0
     @State private var contentScale = 0.98
     @StateObject private var categoryStore = CategoryStore()
-    
+    @StateObject private var journalCoordinator = JournalCoordinator()
+
     init() {
         // Comment out for production - only use for testing onboarding
         // UserDefaults.standard.set(false, forKey: "didOnboard")
@@ -45,6 +106,7 @@ struct DayflowApp: App {
                         AppRootView()
                             .environmentObject(categoryStore)
                             .environmentObject(updaterManager)
+                            .environmentObject(journalCoordinator)
                     } else {
                         OnboardingFlow()
                             .environmentObject(AppState.shared)
@@ -67,17 +129,45 @@ struct DayflowApp: App {
                                 contentOpacity = 1.0
                                 contentScale = 1.0
                             }
-                            
+
                             // Slightly delayed video exit for overlap
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                                 withAnimation(.easeIn(duration: 0.2)) {
                                     showVideoLaunch = false
                                 }
                             }
+
+                            // Handle pending navigation from notification tap
+                            if AppDelegate.pendingNavigationToJournal {
+                                AppDelegate.pendingNavigationToJournal = false
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                    NotificationCenter.default.post(name: .navigateToJournal, object: nil)
+                                }
+                            }
                         }
                         .opacity(showVideoLaunch ? 1 : 0)
                         .scaleEffect(showVideoLaunch ? 1 : 1.02)
                         .animation(.easeIn(duration: 0.2), value: showVideoLaunch)
+                        .onAppear {
+                            // Skip video if opening via notification tap
+                            if AppDelegate.pendingNavigationToJournal {
+                                showVideoLaunch = false
+                                contentOpacity = 1.0
+                                contentScale = 1.0
+                            }
+                        }
+                }
+
+                // Journal onboarding video (full window coverage, above sidebar)
+                if journalCoordinator.showOnboardingVideo {
+                    JournalOnboardingVideoView(onComplete: {
+                        withAnimation(.easeOut(duration: 0.3)) {
+                            journalCoordinator.showOnboardingVideo = false
+                            hasCompletedJournalOnboarding = true
+                        }
+                    })
+                    .ignoresSafeArea()
+                    .transition(.opacity)
                 }
             }
             // Inline background behind the main app UI only
@@ -124,8 +214,25 @@ struct DayflowApp: App {
                 Button("Check for Updates…") {
                     updaterManager.checkForUpdates(showUI: true)
                 }
+
+                Button("View Release Notes") {
+                    // Activate the app and bring to foreground
+                    NSApp.activate(ignoringOtherApps: true)
+
+                    // Post notification to show What's New modal
+                    NotificationCenter.default.post(name: .showWhatsNew, object: nil)
+                }
+                .keyboardShortcut("N", modifiers: [.command, .shift])
             }
         }
         .defaultSize(width: 1200, height: 800)
     }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let showWhatsNew = Notification.Name("showWhatsNew")
+    static let navigateToJournal = Notification.Name("navigateToJournal")
+    static let timelineDataUpdated = Notification.Name("timelineDataUpdated")
 }

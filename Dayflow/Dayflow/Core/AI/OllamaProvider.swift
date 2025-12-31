@@ -4,27 +4,36 @@
 //
 
 import Foundation
-import AVFoundation
 import AppKit
-import CoreImage
-import ImageIO
-import UniformTypeIdentifiers
 
 final class OllamaProvider: LLMProvider {
     private let endpoint: String
+    private let screenshotInterval: TimeInterval = 10  // seconds between screenshots
     // Read persisted local settings
     private var savedModelId: String {
         if let m = UserDefaults.standard.string(forKey: "llmLocalModelId"), !m.isEmpty {
             return m
         }
         // Fallback to a sensible default
-        return isLMStudio ? "qwen2.5-vl-3b-instruct" : "qwen2.5vl:3b"
+        let engine: LocalEngine = isLMStudio ? .lmstudio : .ollama
+        return LocalModelPreferences.defaultModelId(for: engine)
     }
     private var isLMStudio: Bool {
         (UserDefaults.standard.string(forKey: "llmLocalEngine") ?? "ollama") == "lmstudio"
     }
-    private let frameExtractionInterval: TimeInterval = 60.0 // Extract frame every 60 seconds
-    
+    private var isCustomEngine: Bool {
+        (UserDefaults.standard.string(forKey: "llmLocalEngine") ?? "ollama") == "custom"
+    }
+    private var customAPIKey: String? {
+        let trimmed = UserDefaults.standard.string(forKey: "llmLocalAPIKey")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    // Get the actual local engine type for analytics tracking
+    private var localEngine: String {
+        UserDefaults.standard.string(forKey: "llmLocalEngine") ?? "ollama"
+    }
+
     init(endpoint: String = "http://localhost:1234") {
         self.endpoint = endpoint
     }
@@ -39,61 +48,22 @@ final class OllamaProvider: LLMProvider {
             .replacingOccurrences(of: "The user", with: "", options: .caseInsensitive)
             .replacingOccurrences(of: "A user", with: "", options: .caseInsensitive)
     }
-    
-    func transcribeVideo(videoData: Data, mimeType: String, prompt: String, batchStartTime: Date, videoDuration: TimeInterval, batchId: Int64?) async throws -> (observations: [Observation], log: LLMCall) {
-        let callStart = Date()
-        
-        // Save video to temporary file for processing
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
-        try videoData.write(to: tempURL)
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-        
-        // Step 1: Extract frames at intervals
-        let extractionStart = Date()
-        let frames = try await extractFrames(from: tempURL)
-        let extractionTime = Date().timeIntervalSince(extractionStart)
-        
-        
-        // Step 2: Get simple descriptions for each frame
-        var frameDescriptions: [(timestamp: TimeInterval, description: String)] = []
-        
-        for frame in frames {
-            if let description = await getSimpleFrameDescription(frame, batchId: batchId) {
-                frameDescriptions.append((timestamp: frame.timestamp, description: description))
-            }
-        }
-        
-        // Step 3: Merge frame descriptions into coherent observations
-        let mergeStart = Date()
-        let observations = try await mergeFrameDescriptions(
-            frameDescriptions,
-            batchStartTime: batchStartTime,
-            videoDuration: videoDuration,
-            batchId: batchId
-        )
-        let mergeTime = Date().timeIntervalSince(mergeStart)
-        
-        
-        let totalTime = Date().timeIntervalSince(callStart)
-        let durationStr = String(format: "%.2f", totalTime)
-        
-        let log = LLMCall(
-            timestamp: callStart,
-            latency: totalTime,
-            input: "Two-stage processing: \(frames.count) frames → \(observations.count) observations",
-            output: "Extracted \(frames.count) frames, merged into \(observations.count) observations in \(durationStr)s"
-        )
-        
-        return (observations, log)
-    }
-    
+
     func generateActivityCards(observations: [Observation], context: ActivityGenerationContext, batchId: Int64?) async throws -> (cards: [ActivityCardData], log: LLMCall) {
         let callStart = Date()
         var logs: [String] = []
         
         let sortedObservations = context.batchObservations.sorted { $0.startTs < $1.startTs }
-        
-        
+
+        guard let firstObservation = sortedObservations.first,
+              let lastObservation = sortedObservations.last else {
+            throw NSError(
+                domain: "OllamaProvider",
+                code: 16,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot generate activity cards: no observations provided"]
+            )
+        }
+
         // Generate initial activity card for these observations
         let (titleSummary, firstLog) = try await generateTitleAndSummary(
             observations: sortedObservations,
@@ -105,8 +75,8 @@ final class OllamaProvider: LLMProvider {
         let normalizedCategory = normalizeCategory(titleSummary.category, categories: context.categories)
 
         let initialCard = ActivityCardData(
-            startTime: formatTimestampForPrompt(sortedObservations.first!.startTs),
-            endTime: formatTimestampForPrompt(sortedObservations.last!.endTs),
+            startTime: formatTimestampForPrompt(firstObservation.startTs),
+            endTime: formatTimestampForPrompt(lastObservation.endTs),
             category: normalizedCategory,
             subcategory: "",
             title: titleSummary.title,
@@ -269,105 +239,15 @@ final class OllamaProvider: LLMProvider {
     
     private struct FrameData {
         let image: Data  // Base64 encoded image
-        let timestamp: TimeInterval  // Seconds from video start
+        let timestamp: TimeInterval  // Seconds from batch start
     }
-    
-    private func extractFrames(from videoURL: URL) async throws -> [FrameData] {
-        let asset = AVAsset(url: videoURL)
-        let duration = try await asset.load(.duration)
-        let durationSeconds = CMTimeGetSeconds(duration)
-        
-        
-        guard durationSeconds > 0 else {
-            throw NSError(domain: "OllamaProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid video duration"])
-        }
-        
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
-        generator.appliesPreferredTrackTransform = true
-        
-        var frames: [FrameData] = []
-        var currentTime: TimeInterval = 0
-        
-        while currentTime < durationSeconds {
-            let cmTime = CMTime(seconds: currentTime, preferredTimescale: 600)
-            
-            do {
-                let cgImage = try generator.copyCGImage(at: cmTime, actualTime: nil)
-                
-                // Convert CGImage to JPEG data
-                // Downscale by 2/3 for optimal quality/size balance
-                if let scaledImage = downscaleImage(cgImage: cgImage, scale: 2.0/3.0) {
-                    if let imageData = cgImageToJPEGData(scaledImage) {
-                        // Convert to base64
-                        let base64String = imageData.base64EncodedString()
-                        let base64Data = Data(base64String.utf8)
-                        
-                        frames.append(FrameData(image: base64Data, timestamp: currentTime))
-                    }
-                }
-            } catch {
-                print("[OLLAMA] WARNING: Failed to extract frame at \(currentTime)s: \(error)")
-            }
-            
-            currentTime += frameExtractionInterval
-        }
-        
-        return frames
-    }
-    
-    private func downscaleImage(cgImage: CGImage, scale: CGFloat) -> CGImage? {
-        
-        // Create CIImage and apply Lanczos scaling
-        let ciImage = CIImage(cgImage: cgImage)
-        
-        guard let filter = CIFilter(name: "CILanczosScaleTransform") else { return nil }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(scale, forKey: kCIInputScaleKey)
-        filter.setValue(1.0, forKey: kCIInputAspectRatioKey)
-        
-        guard var outputImage = filter.outputImage else { return nil }
-        
-        // Apply slight sharpening for text clarity
-        if let sharpen = CIFilter(name: "CISharpenLuminance") {
-            sharpen.setValue(outputImage, forKey: kCIInputImageKey)
-            sharpen.setValue(0.3, forKey: "inputSharpness")
-            outputImage = sharpen.outputImage ?? outputImage
-        }
-        
-        // Render with high quality
-        let context = CIContext(options: [
-            .highQualityDownsample: true
-        ])
-        
-        return context.createCGImage(outputImage, from: outputImage.extent)
-    }
-    
-    private func cgImageToJPEGData(_ cgImage: CGImage) -> Data? {
-        let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-        
-        guard let tiffData = nsImage.tiffRepresentation,
-              let bitmapRep = NSBitmapImageRep(data: tiffData) else {
-            return nil
-        }
-        
-        // Higher quality JPEG for better text
-        let jpegData = bitmapRep.representation(using: .jpeg, properties: [
-            NSBitmapImageRep.PropertyKey.compressionFactor: 0.95
-        ])
-        
-        
-        return jpegData
-    }
-    
-    
+
     private struct ChatRequest: Codable {
         let model: String
         let messages: [ChatMessage]
-        let temperature: Double = 0.7
-        let max_tokens: Int = -1
-        let stream: Bool = false
+        var temperature: Double = 0.7
+        var max_tokens: Int = 4000
+        var stream: Bool = false
     }
     
     private struct ChatMessage: Codable {
@@ -401,7 +281,7 @@ final class OllamaProvider: LLMProvider {
         // Simple prompt focused on just describing what's happening
         let prompt = """
         Describe what you see on this computer screen in 1-2 sentences.
-        Focus on: what application is open, what the user is doing, and any relevant details visible.
+        Focus on: what application/site is open, what the user is doing, and any relevant details visible.
         Be specific and factual.
         
         GOOD EXAMPLES:
@@ -422,7 +302,7 @@ final class OllamaProvider: LLMProvider {
         }
         
         // Build message content with image and text
-        var content: [MessageContent] = [
+        let content: [MessageContent] = [
             MessageContent(type: "text", text: prompt, image_url: nil),
             MessageContent(type: "image_url", text: nil, image_url: MessageContent.ImageURL(url: "data:image/jpeg;base64,\(base64String)"))
         ]
@@ -445,7 +325,9 @@ final class OllamaProvider: LLMProvider {
     }
 
     private func callChatAPI(_ request: ChatRequest, operation: String, batchId: Int64? = nil, maxRetries: Int = 3) async throws -> ChatResponse {
-        let url = URL(string: "\(endpoint)/v1/chat/completions")!
+        guard let url = LocalEndpointUtilities.chatCompletionsURL(baseURL: endpoint) else {
+            throw NSError(domain: "OllamaProvider", code: 15, userInfo: [NSLocalizedDescriptionKey: "Invalid local endpoint URL"])
+        }
         
         // Retry logic with exponential backoff
         let attempts = max(1, maxRetries)
@@ -459,11 +341,9 @@ final class OllamaProvider: LLMProvider {
                 var urlRequest = URLRequest(url: url)
                 urlRequest.httpMethod = "POST"
                 urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                if isLMStudio {
-                    urlRequest.setValue("Bearer lm-studio", forHTTPHeaderField: "Authorization")
-                }
+                applyAuthorizationHeader(to: &urlRequest)
                 urlRequest.httpBody = try JSONEncoder().encode(request)
-                urlRequest.timeoutInterval = 30.0  // 30-second timeout
+                urlRequest.timeoutInterval = 60.0  // 60-second timeout
                 
                 let apiStart = Date()
                 let requestBodyForLogging: Data?
@@ -477,7 +357,7 @@ final class OllamaProvider: LLMProvider {
                     batchId: batchId,
                     callGroupId: callGroupId,
                     attempt: attempt + 1,
-                    provider: "ollama",
+                    provider: localEngine, // Track actual engine: ollama, lmstudio, or custom
                     model: request.model,
                     operation: operation,
                     requestMethod: urlRequest.httpMethod,
@@ -488,8 +368,7 @@ final class OllamaProvider: LLMProvider {
                 )
                 ctxForAttempt = ctx
                 let (data, response) = try await URLSession.shared.data(for: urlRequest)
-                let apiTime = Date().timeIntervalSince(apiStart)
-                
+
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw NSError(domain: "OllamaProvider", code: 4, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
                 }
@@ -564,7 +443,7 @@ final class OllamaProvider: LLMProvider {
                         batchId: batchId,
                         callGroupId: callGroupId,
                         attempt: attempt + 1,
-                        provider: "ollama",
+                        provider: localEngine, // Track actual engine: ollama, lmstudio, or custom
                         model: request.model,
                         operation: operation,
                         requestMethod: "POST",
@@ -686,6 +565,8 @@ final class OllamaProvider: LLMProvider {
             .map { "\"\($0.name)\"" }
             .joined(separator: ", ")
 
+        let promptSections = OllamaPromptSections(overrides: OllamaPromptPreferences.load())
+
         let basePrompt = """
         You are analyzing someone's computer activity from the last 15 minutes.
 
@@ -694,33 +575,7 @@ final class OllamaProvider: LLMProvider {
 
           Create a summary that captures what happened during this time period.
 
-          SUMMARY GUIDELINES:
-          - Write in first person without using "I" (like a personal journal entry)
-          - Start sentences with action verbs: "Managed...", "Browsed...", "Searched..."
-          - 2-3 sentences maximum
-          - Include specific details (app names, search topics, etc.)
-          - Natural, conversational tone
-
-          GOOD EXAMPLES:
-          "Managed Mac system preferences focusing on software updates and accessibility settings. Browsed Chrome searching for iPhone wireless charging info while
-          checking Twitter and Slack messages."
-
-          "Configured GitHub Actions pipeline for automated testing. Quick Slack check interrupted focus, then back to debugging deployment issues."
-
-          "Researched React performance optimization techniques in Chrome, reading articles about useMemo patterns. Switched between documentation tabs and took notes in
-           Notion about component re-rendering."
-
-          "Updated Xcode project dependencies and resolved build errors in SwiftUI views. Tested app on simulator while responding to client messages about timeline
-          changes."
-
-          "Browsed Instagram and TikTok while listening to Spotify playlist. Responded to personal messages on WhatsApp about weekend plans."
-
-          "Researched vacation destinations on travel websites and compared flight prices. Checked weather forecasts for different cities while reading travel reviews."
-
-          BAD EXAMPLES:
-          - "The user did various computer activities" (too vague, wrong perspective, never say the user)
-          - "I was working on my computer doing different tasks" (uses "I", not specific)
-          - "Spent time on multiple applications and websites" (generic, no details)
+        \(promptSections.summary)
 
         CATEGORIES:
         Choose exactly one:
@@ -790,50 +645,24 @@ final class OllamaProvider: LLMProvider {
         print("Summary type: \(type(of: summary))")
         print("Summary value: \(summary)")
 
+        let promptSections = OllamaPromptSections(overrides: OllamaPromptPreferences.load())
+
         let basePrompt = """
         Create a casual, conversational title for this activity summary.
 
         INPUT SUMMARY:
         "\(summary)"
 
-        TITLE GUIDELINES:
-        Write like you're texting a friend about what you did today. Keep it 5-8 words maximum.
-        Be specific about what you actually did, not generic descriptions.
-        ⚠️ ONLY use details that exist in the summary - don't add information that wasn't mentioned.
-
-        GOOD EXAMPLES:
-        "Fixed CORS bugs in API endpoints"
-        "Mac settings while researching chargers"
-        "Wrote docs, kept checking Twitter"
-        "iPhone wireless charging research session"
-        "Debugged auth flow, tested endpoints"
-        "Reddit rabbit hole about React patterns"
-
-        BAD EXAMPLES (with explanations):
-
-        ✗ "User engaging in video calls, software updates, and browsing system preferences"
-          WHY BAD: Too long (11 words), formal "engaging", says "User" instead of natural first-person
-
-        ✗ "Browsing and Browsing, Responding to Slack"
-          WHY BAD: Repetitive "Browsing and Browsing", unclear what was browsed, awkward phrasing
-
-        ✗ "Browsing social media and coding project updates"
-          WHY BAD: Generic "browsing social media", vague "project updates", doesn't match actual activity
-
-        ✗ "(Debugging & Coding) User's Time Spans"
-          WHY BAD: Weird parentheses format, formal "Time Spans", says "User's" instead of natural language
-
-        ✗ "User Engages in Social Media Activities"
-          WHY BAD: Formal corporate speak ("engages", "activities"), says "User", too generic
-
-        ✗ "Working on computer tasks and applications"
-          WHY BAD: Completely generic, "working on" is lazy, could describe any computer use
+        \(promptSections.title)
 
         Return JSON:
         {
           "reasoning": "Explain how you chose the title",
-          "title": "5-8 word conversational title using only summary facts"
+          "title": "5-8 word conversational title highlighting one standout activity (optionally plus one other dominant action) using only summary facts"
         }
+
+        Avoid comma-separated lists or multiple conjunctions; only mention a second activity if it clearly shares the spotlight without turning into a checklist.
+        Always describe what happened (e.g., "Reviewed GitHub PRs") instead of just naming apps or panes.
         """
 
         print("[DEBUG] generateTitle final prompt:")
@@ -927,8 +756,6 @@ final class OllamaProvider: LLMProvider {
 
         MERGE DECISION RULE:
         The Golden Rule: When merged, they should tell one coherent story, not two different ones
-
-        ⚠️ BE STRICT! When in doubt, keep them separate.
 
         MERGE ONLY IF:
         ✓ Same project or closely related task
@@ -1036,12 +863,10 @@ final class OllamaProvider: LLMProvider {
         Summary: \(newCard.summary)
 
         Create a unified title and summary that covers the entire period from \(previousCard.startTime) to \(newCard.endTime).
-        Title: 5-10 words, conversational, explicitly name every distinct site, app, or topic mentioned in the inputs, and tie them together with active verbs instead of
-          umbrella categories.
-          Summary: Two or three sentences, first-person perspective without using the word I. Retell the actions in chronological order and reuse the specific proper nouns
-          from the inputs; describe each step with concrete verbs (e.g., read, replied, compared) rather than grouping them under generic labels.
-          Avoid the words social, media, platform, platforms, interaction, interactions, various, engaged, blend, activity, activities.
-          Do not refer to the user; write from the user’s perspective.
+        Title: 5-8 words, conversational, spotlight the main through-line. You may mention one other equally dominant action, but connect it with a quick “while” or em dash—never comma lists or “and” chains. Cite only the most important apps/sites rather than every noun.
+        Summary: Two sentences max, first-person perspective without using the word I. Retell how the work flowed from the first card into the second with concrete verbs (debugged, reviewed, watched) and name the stand-out tools/topics once each. Skip laundry lists, filler like “various tasks,” and bullet points.
+        Avoid the words social, media, platform, platforms, interaction, interactions, various, engaged, blend, activity, activities.
+        Do not refer to the user; write from the user’s perspective.
 
           GOOD EXAMPLES:
           Card 1: Customer interviews wrap-up + Card 2: Insights deck synthesis
@@ -1049,10 +874,11 @@ final class OllamaProvider: LLMProvider {
           Merged Summary: Logged interview quotes into Airtable. Highlighted the strongest themes and molded them into the insights deck outline.
 
           Card 1: QA-ing mobile release + Card 2: Answering support tickets
-          Merged Title: Balanced mobile QA with support triage
-          Merged Summary: Ran through the iOS smoke checklist in TestFlight. Swapped over to Help Scout to clear the high-priority tickets.
+          Merged Title: Balanced mobile QA while clearing support
+          Merged Summary: Ran through the iOS smoke checklist in TestFlight. Hopped into Help Scout to close the urgent tickets.
 
           BAD EXAMPLES:
+          ✗ Title: Coding, gaming, and Swift fixes with AI tools and Dayflow (comma list trying to cover everything)
           ✗ Title: Busy afternoon session (too vague)
           ✗ Summary: Worked on several things across platforms (generic, missing specifics)
           ✗ Summary that omits a named site/app/topic from the inputs
@@ -1149,12 +975,16 @@ final class OllamaProvider: LLMProvider {
         let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
         return formatter.string(from: date)
     }
     
     private func calculateDurationInMinutes(from startTime: String, to endTime: String) -> Int {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
         
         guard let start = formatter.date(from: startTime),
               let end = formatter.date(from: endTime) else {
@@ -1278,14 +1108,14 @@ final class OllamaProvider: LLMProvider {
                     endTs: Int(endDate.timeIntervalSince1970),
                     observation: segment.description,
                     metadata: nil,
-                    llmModel: "qwen2.5vl:3b",
+                    llmModel: savedModelId,
                     createdAt: Date()
                 )
             )
         }
 
         if observations.isEmpty {
-            throw NSError(domain: "OllamaProvider", code: 11, userInfo: [NSLocalizedDescriptionKey: "No valid observations generated from merge"])
+            throw NSError(domain: "OllamaProvider", code: 11, userInfo: [NSLocalizedDescriptionKey: "Screenshots failed to process - check Ollama/LMStudio logs or report a bug."])
         }
 
         if observations.count > 5 {
@@ -1312,7 +1142,7 @@ final class OllamaProvider: LLMProvider {
             throw NSError(
                 domain: "OllamaProvider",
                 code: 11,
-                userInfo: [NSLocalizedDescriptionKey: "No valid observations generated from frame fallback"]
+                userInfo: [NSLocalizedDescriptionKey: "It looks like your local AI is currently down. Please make sure that your Ollama/LMStudio is up and running properly. If you're having trouble getting local AI to work, consider switching to Gemini in settings."]
             )
         }
 
@@ -1322,7 +1152,7 @@ final class OllamaProvider: LLMProvider {
 
         for (index, frame) in sortedFrames.enumerated() {
             let startSeconds = max(0, frame.timestamp)
-            var endSeconds = startSeconds + frameExtractionInterval
+            var endSeconds = startSeconds + screenshotInterval
 
             if index + 1 < sortedFrames.count {
                 endSeconds = min(endSeconds, sortedFrames[index + 1].timestamp)
@@ -1333,7 +1163,7 @@ final class OllamaProvider: LLMProvider {
             }
 
             if endSeconds <= startSeconds {
-                endSeconds = startSeconds + max(1, frameExtractionInterval)
+                endSeconds = startSeconds + max(1, screenshotInterval)
                 if let cap = durationCap {
                     endSeconds = min(endSeconds, cap)
                 }
@@ -1441,6 +1271,18 @@ final class OllamaProvider: LLMProvider {
                 return observations
             } catch let coverageError as SegmentCoverageError {
                 lastError = coverageError
+                let coveragePercent = max(0, min(100, Int(coverageError.coverageRatio * 100)))
+
+                AnalyticsService.shared.captureValidationFailure(
+                    provider: "ollama",
+                    operation: "segment_video_activity",
+                    validationType: "coverage",
+                    attempt: attempt,
+                    model: savedModelId,
+                    batchId: batchId,
+                    errorDetail: "Coverage only \(coveragePercent)% (expected >80%)"
+                )
+
                 if attempt == maxAttempts {
                     print("[OLLAMA] ❌ segment_video_activity retries exhausted (coverage) — returning raw frame observations")
                     return try observationsFromFrames(
@@ -1450,7 +1292,6 @@ final class OllamaProvider: LLMProvider {
                     )
                 }
 
-                let coveragePercent = max(0, min(100, Int(coverageError.coverageRatio * 100)))
                 print("[OLLAMA] ⚠️ Segment coverage attempt \(attempt) only reached \(coveragePercent)% — retrying")
 
                 prompt = basePrompt + """
@@ -1486,5 +1327,113 @@ final class OllamaProvider: LLMProvider {
             code: 9,
             userInfo: [NSLocalizedDescriptionKey: "Failed to generate merged observations after multiple attempts"]
         )
+    }
+}
+
+extension OllamaProvider {
+    private func applyAuthorizationHeader(to request: inout URLRequest) {
+        if isLMStudio {
+            request.setValue("Bearer lm-studio", forHTTPHeaderField: "Authorization")
+        } else if isCustomEngine, let token = customAPIKey {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+    }
+}
+
+// MARK: - Text Generation
+
+extension OllamaProvider {
+    func generateText(prompt: String) async throws -> (text: String, log: LLMCall) {
+        let callStart = Date()
+
+        let response = try await callTextAPI(prompt, operation: "generate_text", expectJSON: false, batchId: nil, maxRetries: 3)
+
+        let log = LLMCall(
+            timestamp: callStart,
+            latency: Date().timeIntervalSince(callStart),
+            input: prompt,
+            output: response
+        )
+
+        return (response.trimmingCharacters(in: .whitespacesAndNewlines), log)
+    }
+}
+
+// MARK: - Screenshot Transcription
+
+extension OllamaProvider {
+    /// Transcribe observations from screenshots.
+    func transcribeScreenshots(_ screenshots: [Screenshot], batchStartTime: Date, batchId: Int64?) async throws -> (observations: [Observation], log: LLMCall) {
+        guard !screenshots.isEmpty else {
+            throw NSError(domain: "OllamaProvider", code: 12, userInfo: [NSLocalizedDescriptionKey: "No screenshots to transcribe"])
+        }
+
+        let callStart = Date()
+        let sortedScreenshots = screenshots.sorted { $0.capturedAt < $1.capturedAt }
+
+        // Sample ~15 evenly spaced screenshots to avoid hammering the local LLM
+        let targetSamples = 15
+        let strideAmount = max(1, sortedScreenshots.count / targetSamples)
+        let sampledScreenshots = Swift.stride(from: 0, to: sortedScreenshots.count, by: strideAmount).map { sortedScreenshots[$0] }
+
+        // Calculate duration from timestamp range
+        let firstTs = sampledScreenshots.first!.capturedAt
+        let lastTs = sampledScreenshots.last!.capturedAt
+        let durationSeconds = TimeInterval(lastTs - firstTs)
+
+        // Describe each screenshot
+        var frameDescriptions: [(timestamp: TimeInterval, description: String)] = []
+
+        for screenshot in sampledScreenshots {
+            guard let frameData = loadScreenshotAsFrameData(screenshot, relativeTo: firstTs) else {
+                print("[OLLAMA] ⚠️ Failed to load screenshot: \(screenshot.filePath)")
+                continue
+            }
+
+            if let description = await getSimpleFrameDescription(frameData, batchId: batchId) {
+                frameDescriptions.append((timestamp: frameData.timestamp, description: description))
+            }
+        }
+
+        guard !frameDescriptions.isEmpty else {
+            throw NSError(
+                domain: "OllamaProvider",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to describe any screenshots. Please check that Ollama/LMStudio is running."]
+            )
+        }
+
+        // Merge frame descriptions into coherent observations
+        let observations = try await mergeFrameDescriptions(
+            frameDescriptions,
+            batchStartTime: batchStartTime,
+            videoDuration: durationSeconds,
+            batchId: batchId
+        )
+
+        let totalTime = Date().timeIntervalSince(callStart)
+        let log = LLMCall(
+            timestamp: callStart,
+            latency: totalTime,
+            input: "Screenshot transcription: \(screenshots.count) screenshots → \(observations.count) observations",
+            output: "Processed \(screenshots.count) screenshots in \(String(format: "%.2f", totalTime))s"
+        )
+
+        return (observations, log)
+    }
+
+    /// Load a screenshot file and convert it to FrameData for description
+    private func loadScreenshotAsFrameData(_ screenshot: Screenshot, relativeTo baseTimestamp: Int) -> FrameData? {
+        let url = URL(fileURLWithPath: screenshot.filePath)
+
+        guard let imageData = try? Data(contentsOf: url) else {
+            return nil
+        }
+
+        let base64String = imageData.base64EncodedString()
+        let base64Data = Data(base64String.utf8)
+        let relativeTimestamp = TimeInterval(screenshot.capturedAt - baseTimestamp)
+
+        return FrameData(image: base64Data, timestamp: relativeTimestamp)
     }
 }

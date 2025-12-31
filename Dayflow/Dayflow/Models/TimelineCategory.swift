@@ -48,6 +48,7 @@ struct LLMCategoryDescriptor: Codable, Equatable, Hashable, Sendable {
 
 @MainActor
 final class CategoryStore: ObservableObject {
+    static let shared = CategoryStore()
     enum StoreKeys {
         static let categories = "colorCategories"
         static let hasUsedApp = "hasUsedApp"
@@ -172,11 +173,8 @@ final class CategoryStore: ObservableObject {
 
     private func load() {
         let decoded = CategoryPersistence.loadPersistedCategories()
-        if decoded.isEmpty {
-            categories = CategoryPersistence.defaultCategories
-        } else {
-            categories = CategoryPersistence.ensureIdleCategoryPresent(in: decoded)
-        }
+        let effective = decoded.isEmpty ? CategoryPersistence.defaultCategories : decoded
+        categories = CategoryPersistence.ensureIdleCategoryPresent(in: effective)
     }
 
     private func save() {
@@ -264,28 +262,28 @@ enum CategoryPersistence {
                 "#B984FF",
                 false,
                 false,
-                "Professional, school, or career-focused tasks (coding, design, meetings, research)."
+                "Career, school, or productivity-focused activities (projects, emails, assignments, video calls, learning skills, etc.)"
             ),
             (
                 "Personal",
                 "#6AADFF",
                 false,
                 false,
-                "Intentional non-work activities for life, wellbeing, hobbies, or personal errands."
+                "Purposeful non-work activities or life tasks (paying bills, fitness tracking, meal planning, personal research, creative hobbies, etc.)"
             ),
             (
                 "Distraction",
                 "#FF5950",
                 false,
                 false,
-                "Unplanned, aimless, or compulsive time sinks (social media, doomscrolling, non-work videos, rabbit holes)."
+                "Passive consumption or aimless browsing (scrolling feeds, watching random videos, clicking through news, mindless games, etc.)"
             ),
             (
                 "Idle",
                 "#A0AEC0",
                 true,
                 true,
-                "Mark sessions where the user is idle for most of the time."
+                "For when the user is idle for most of the time."
             )
         ]
         return base.enumerated().map { idx, entry in

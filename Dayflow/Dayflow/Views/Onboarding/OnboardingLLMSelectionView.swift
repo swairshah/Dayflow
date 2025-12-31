@@ -18,6 +18,9 @@ struct OnboardingLLMSelectionView: View {
     @State private var cardsOpacity: Double = 0
     @State private var bottomTextOpacity: Double = 0
     @State private var hasAppeared: Bool = false
+    @State private var cliDetected: Bool = false
+    @State private var cliDetectionTask: Task<Void, Never>?
+    @State private var didUserSelectProvider: Bool = false
     
     var body: some View {
         GeometryReader { geometry in
@@ -44,7 +47,7 @@ struct OnboardingLLMSelectionView: View {
 
             VStack(spacing: 0) {
                 // Header
-                Text("Choose a way to run Dayflow")
+                    Text("Choose a way to run Dayflow")
                     .font(.custom("InstrumentSerif-Regular", size: titleSize))
                     .multilineTextAlignment(.center)
                     .foregroundColor(.black.opacity(0.9))
@@ -54,6 +57,7 @@ struct OnboardingLLMSelectionView: View {
                     .onAppear {
                         guard !hasAppeared else { return }
                         hasAppeared = true
+                        detectCLIInstallation()
                         withAnimation(.easeOut(duration: 0.6)) { titleOpacity = 1 }
                         animateContent()
                     }
@@ -75,13 +79,23 @@ struct OnboardingLLMSelectionView: View {
                 // Footer
                 HStack(spacing: 0) {
                     Group {
-                        Text("Not sure which to choose? ")
-                            .foregroundColor(.black.opacity(0.6))
-                        + Text("Bring your own keys is the easiest setup (30s).")
-                            .fontWeight(.semibold)
-                            .foregroundColor(.black.opacity(0.8))
-                        + Text(" You can switch at any time in the settings.")
-                            .foregroundColor(.black.opacity(0.6))
+                        if cliDetected {
+                            Text("You have Codex/Claude CLI installed! ")
+                                .foregroundColor(.black.opacity(0.6))
+                            + Text("We recommend using it for the best experience.")
+                                .fontWeight(.semibold)
+                                .foregroundColor(.black.opacity(0.8))
+                            + Text(" You can switch at any time in the settings.")
+                                .foregroundColor(.black.opacity(0.6))
+                        } else {
+                            Text("Not sure which to choose? ")
+                                .foregroundColor(.black.opacity(0.6))
+                            + Text("Bring your own keys is the easiest setup (30s).")
+                                .fontWeight(.semibold)
+                                .foregroundColor(.black.opacity(0.8))
+                            + Text(" You can switch at any time in the settings.")
+                                .foregroundColor(.black.opacity(0.6))
+                        }
                     }
                     .font(.custom("Nunito", size: 14))
                     .multilineTextAlignment(.center)
@@ -92,6 +106,10 @@ struct OnboardingLLMSelectionView: View {
             }
             .animation(.easeOut(duration: 0.2), value: cardWidth)
             .animation(.easeOut(duration: 0.2), value: cardHeight)
+        }
+        .onDisappear {
+            cliDetectionTask?.cancel()
+            cliDetectionTask = nil
         }
     }
     
@@ -108,7 +126,7 @@ struct OnboardingLLMSelectionView: View {
                 features: [
                     ("100% private - everything's processed on your computer", true),
                     ("Works completely offline", true),
-                    ("Significantly less intelligence", true),
+                    ("Significantly less intelligence", false),
                     ("Requires the most setup", false),
                     ("16GB+ of RAM recommended", false),
                     ("Can be battery-intensive", false)
@@ -122,12 +140,14 @@ struct OnboardingLLMSelectionView: View {
                     } else {
                         // Select the card first
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                            didUserSelectProvider = true
                             selectedProvider = "ollama"
                         }
                     }
                 }),
                 onSelect: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                        didUserSelectProvider = true
                         selectedProvider = "ollama"
                     }
                 }
@@ -136,10 +156,10 @@ struct OnboardingLLMSelectionView: View {
             // Bring your own API card (selected by default)
             FlexibleProviderCard(
                 id: "gemini",
-                title: "Bring your own API keys",
-                badgeText: "RECOMMENDED",
-                badgeType: .orange,
-                icon: "key.fill",
+                title: "Gemini",
+                badgeText: cliDetected ? "NEW" : "RECOMMENDED",
+                badgeType: cliDetected ? .blue : .orange,
+                icon: "gemini_asset",
                 features: [
                     ("Utilizes more intelligent AI via Google's Gemini models", true),
                     ("Uses Gemini's generous free tier (no credit card needed)", true),
@@ -155,13 +175,49 @@ struct OnboardingLLMSelectionView: View {
                     } else {
                         // Select the card first
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                            didUserSelectProvider = true
                             selectedProvider = "gemini"
                         }
                     }
                 }),
                 onSelect: {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                        didUserSelectProvider = true
                         selectedProvider = "gemini"
+                    }
+                }
+            ),
+
+            // ChatGPT/Claude CLI card
+            FlexibleProviderCard(
+                id: "chatgpt_claude",
+                title: "ChatGPT or Claude",
+                badgeText: cliDetected ? "RECOMMENDED" : "NEW",
+                badgeType: cliDetected ? .orange : .blue,
+                icon: "chatgpt_claude_asset",
+                features: [
+                    ("Perfect for existing ChatGPT Plus or Claude Pro subscribers", true),
+                    ("Superior intelligence and reliability", true),
+                    ("Minimal impact - uses <1% of your daily limit", true),
+                    ("Requires installing Codex or Claude CLI", false),
+                    ("Requires a paid ChatGPT or Claude subscription", false)
+                ],
+                isSelected: selectedProvider == "chatgpt_claude",
+                buttonMode: .onboarding(onProceed: {
+                    if selectedProvider == "chatgpt_claude" {
+                        saveProviderSelection()
+                        onNext("chatgpt_claude")
+                    } else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                            didUserSelectProvider = true
+                            selectedProvider = "chatgpt_claude"
+                        }
+                    }
+                }),
+                onSelect: {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                        didUserSelectProvider = true
+                        selectedProvider = "chatgpt_claude"
                     }
                 }
             ),
@@ -215,10 +271,13 @@ struct OnboardingLLMSelectionView: View {
             providerType = .geminiDirect
         case "dayflow":
             providerType = .dayflowBackend()
+        case "chatgpt_claude":
+            providerType = .chatGPTClaude
         default:
             providerType = .geminiDirect
         }
         
+        UserDefaults.standard.set(selectedProvider, forKey: "selectedLLMProvider")
         if let encoded = try? JSONEncoder().encode(providerType) {
             UserDefaults.standard.set(encoded, forKey: "llmProviderType")
         }
@@ -230,10 +289,29 @@ struct OnboardingLLMSelectionView: View {
                 cardsOpacity = 1
             }
         }
-        
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             withAnimation(.easeOut(duration: 0.4)) {
                 bottomTextOpacity = 1
+            }
+        }
+    }
+
+    private func detectCLIInstallation() {
+        cliDetectionTask?.cancel()
+        cliDetectionTask = Task { @MainActor in
+            let installed = await Task.detached(priority: .utility) {
+                let codexInstalled = CLIDetector.isInstalled(.codex)
+                let claudeInstalled = CLIDetector.isInstalled(.claude)
+                return codexInstalled || claudeInstalled
+            }.value
+
+            guard !Task.isCancelled else { return }
+
+            cliDetected = installed
+
+            if !didUserSelectProvider {
+                selectedProvider = installed ? "chatgpt_claude" : "gemini"
             }
         }
     }

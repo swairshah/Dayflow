@@ -25,7 +25,7 @@ This document lists manual events, properties, and code locations. All events re
 - onboarding_started
   - file: Views/Onboarding/OnboardingFlow.swift (welcome appear)
 - onboarding_step_completed
-  - props: `step: welcome|how_it_works|screen_recording|llm_selection|llm_setup|completion`
+  - props: `step: welcome|how_it_works|llm_selection|llm_setup|categories|screen_recording|completion`
   - file: Views/Onboarding/OnboardingFlow.swift
 - llm_provider_selected
   - props: `provider: gemini|ollama|dayflow`
@@ -70,6 +70,9 @@ This document lists manual events, properties, and code locations. All events re
 - activity_card_opened
   - props: `activity_type: string`, `duration_bucket: string`, `has_video: bool`
   - file: Views/UI/MainView.swift
+- timeline_copied
+  - props: `timeline_day: yyyy-MM-dd`, `activity_count: int`
+  - file: Views/UI/MainView.swift
 
 ## Video
 - video_modal_opened
@@ -108,7 +111,7 @@ This document lists manual events, properties, and code locations. All events re
 
 ## AI / LLM / Analysis
 - analysis_job_started
-  - props: `provider: gemini|ollama|dayflow|unknown`
+  - props: `provider: gemini|ollama|dayflow|chat_cli|unknown`
   - file: App/AppDelegate.swift
 - llm_api_call (sampled ~10%)
   - props: `provider: string`, `model: string`, `latency_ms_bucket: <500ms|0.5-1.5s|>=1.5s`, `outcome: success|error`, `error_code?: int`

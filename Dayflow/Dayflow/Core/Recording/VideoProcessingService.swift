@@ -2,6 +2,8 @@ import AVFoundation
 import Foundation
 import CoreGraphics
 
+import AppKit
+
 enum VideoProcessingError: Error {
     case invalidInputURL
     case assetLoadFailed(Error?)
@@ -18,12 +20,18 @@ enum VideoProcessingError: Error {
     case frameAppendFailed
     case directoryCreationFailed(Error?)
     case fileSaveFailed(Error?)
+    case noInputFiles
+    case invalidImageData
+    case pixelBufferCreationFailed
 }
 
 actor VideoProcessingService {
     private let fileManager = FileManager.default
     private let temporaryDirectoryURL: URL
     private let persistentTimelapsesRootURL: URL
+    private let maxRenderDimension = 1080  // mirror capture target height while allowing wide exports
+
+    private struct TrackInfo: Hashable { let width: Int; let height: Int }
 
     init() {
         self.temporaryDirectoryURL = fileManager.temporaryDirectory
@@ -70,7 +78,7 @@ actor VideoProcessingService {
             .appendingPathComponent(originalFileName + "_timelapse.mp4")
     }
 
-    /// If multiple URLs, stitches them. If sizes/orientations differ, re-renders to a stable 16:9 canvas.
+    /// If multiple URLs, stitches them. If sizes/orientations differ, re-renders to a canvas sized for the largest segment.
     func prepareVideoForProcessing(urls: [URL]) async throws -> URL {
         guard !urls.isEmpty else { throw VideoProcessingError.invalidInputURL }
         let tempOutputURL = newTemporaryFileURL()
@@ -90,7 +98,6 @@ actor VideoProcessingService {
         }
 
         // Inspect tracks to decide homogeneous vs mixed pipeline
-        struct TrackInfo: Hashable { let width: Int; let height: Int }
         var infos = Set<TrackInfo>()
         for url in urls {
             let asset = AVURLAsset(url: url)
@@ -106,7 +113,11 @@ actor VideoProcessingService {
 
         // If mixed dimensions, render to canvas for stability
         if infos.count > 1 {
-            return try await stitchToCanvas(urls: urls, canvas: CGSize(width: 1920, height: 1080))
+            let canvasDims = targetCanvasDimensions(for: infos)
+            return try await stitchToCanvas(
+                urls: urls,
+                canvas: CGSize(width: CGFloat(canvasDims.width), height: CGFloat(canvasDims.height))
+            )
         }
 
         // Stitch multiple files (homogeneous path)
@@ -208,7 +219,7 @@ actor VideoProcessingService {
         videoComp.instructions = instructions
 
         let outputURL = newTemporaryFileURL()
-        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPreset1920x1080) else {
+        guard let export = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
             throw VideoProcessingError.exportSessionCreationFailed
         }
         export.videoComposition = videoComp
@@ -269,10 +280,10 @@ actor VideoProcessingService {
         let naturalSize = try await assetTrack.load(.naturalSize)
         let preferredTransform = try await assetTrack.load(.preferredTransform)
         let actualSize = naturalSize.applying(preferredTransform)
-        let width = Int(abs(actualSize.width))
-        let height = Int(abs(actualSize.height))
-        let nominalFrameRate = try await assetTrack.load(.nominalFrameRate)
-        
+        let width = Int(abs(actualSize.width).rounded())
+        let height = Int(abs(actualSize.height).rounded())
+        _ = try await assetTrack.load(.nominalFrameRate)
+
         // Create composition with time mapping for speedup
         let composition = AVMutableComposition()
         guard let compositionTrack = composition.addMutableTrack(withMediaType: .video,
@@ -308,14 +319,19 @@ actor VideoProcessingService {
             throw VideoProcessingError.assetWriterCreationFailed(nil)
         }
         
-        // Cap resolution at 1080p
-        let outputWidth = min(width, 1920)
-        let outputHeight = min(height, 1080)
-        
-        // Custom bitrate: 3 Mbps for 1080p timelapse (much lower than default ~8 Mbps)
-        let bitrate = 3_000_000
-        
-        print("🎬 Timelapse encoding: \(outputWidth)×\(outputHeight) @ \(outputFPS)fps, bitrate: \(bitrate/1_000_000)Mbps")
+        let dims = normalizedDimensions(width: width, height: height)
+        let outputWidth = dims.width
+        let outputHeight = dims.height
+
+        // Scale bitrate with pixel area to preserve quality on wide screens without huge files
+        let baseBitrate = 3_000_000
+        let minBitrate = 1_500_000
+        let maxBitrate = 10_000_000
+        let areaRatio = Double(outputWidth * outputHeight) / (1920.0 * 1080.0)
+        let scaledBitrate = Int((Double(baseBitrate) * max(areaRatio, 0.5)).rounded())
+        let bitrate = min(max(scaledBitrate, minBitrate), maxBitrate)
+
+        print("🎬 Timelapse encoding: \(outputWidth)×\(outputHeight) @ \(outputFPS)fps, bitrate: \(Double(bitrate) / 1_000_000)Mbps")
         
         let outputSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -351,7 +367,7 @@ actor VideoProcessingService {
         
         // Apply video composition for proper rendering
         let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = CGSize(width: outputWidth, height: outputHeight)
+        videoComposition.renderSize = CGSize(width: CGFloat(outputWidth), height: CGFloat(outputHeight))
         videoComposition.frameDuration = CMTime(value: 1, timescale: Int32(outputFPS))
         
         let instruction = AVMutableVideoCompositionInstruction()
@@ -398,11 +414,316 @@ actor VideoProcessingService {
             print("Timelapse export failed. Status: \(writer.status). Error: \(writer.error?.localizedDescription ?? "No error description available")")
             throw VideoProcessingError.exportFailed(writer.error)
         }
+
+        TimelapseStorageManager.shared.purgeIfNeeded()
+    }
+
+    private func normalizedDimensions(width: Int, height: Int) -> (width: Int, height: Int) {
+        guard width > 0, height > 0 else { return (width: 2, height: 2) }
+
+        var targetWidth = width
+        var targetHeight = height
+
+        if width >= height {
+            if height > maxRenderDimension {
+                let scale = Double(maxRenderDimension) / Double(height)
+                targetHeight = maxRenderDimension
+                targetWidth = max(Int((Double(width) * scale).rounded()), 2)
+            }
+        } else {
+            if width > maxRenderDimension {
+                let scale = Double(maxRenderDimension) / Double(width)
+                targetWidth = maxRenderDimension
+                targetHeight = max(Int((Double(height) * scale).rounded()), 2)
+            }
+        }
+
+        targetWidth = makeEven(targetWidth)
+        targetHeight = makeEven(targetHeight)
+
+        return (targetWidth, targetHeight)
+    }
+
+    private func targetCanvasDimensions(for infos: Set<TrackInfo>) -> (width: Int, height: Int) {
+        guard let maxWidth = infos.map(\.width).max(),
+              let maxHeight = infos.map(\.height).max() else {
+            return normalizedDimensions(width: maxRenderDimension, height: maxRenderDimension)
+        }
+        return normalizedDimensions(width: maxWidth, height: maxHeight)
+    }
+
+    private func makeEven(_ value: Int) -> Int {
+        let even = value - (value % 2)
+        return max(even, 2)
     }
 
     func cleanupTemporaryFile(at url: URL) {
         if fileManager.fileExists(atPath: url.path) {
             try? fileManager.removeItem(at: url)
         }
+    }
+
+    // MARK: - Screenshot to Video Compositing
+
+    /// Composites a series of screenshot images into an MP4 video.
+    /// Used for timelapse generation and Gemini provider (which requires video format).
+    ///
+    /// - Parameters:
+    ///   - screenshots: Array of Screenshot objects, in chronological order
+    ///   - outputURL: Where to write the output MP4
+    ///   - fps: Output frames per second (default 1 = each screenshot is 1 second of video)
+    ///   - useCompressedTimeline: If true, places frames at 1fps (compressed). If false, uses real timestamps.
+    func generateVideoFromScreenshots(
+        screenshots: [Screenshot],
+        outputURL: URL,
+        fps: Int = 1,
+        useCompressedTimeline: Bool = true
+    ) async throws {
+        guard !screenshots.isEmpty else {
+            throw VideoProcessingError.noInputFiles
+        }
+
+        // 1. Find the widest screenshot to use as canvas dimensions
+        //    This ensures all aspect ratios are preserved via letterboxing/pillarboxing
+        var canvasWidth = 0
+        var canvasHeight = 0
+
+        for screenshot in screenshots {
+            guard let imageData = try? Data(contentsOf: screenshot.fileURL),
+                  let nsImage = NSImage(data: imageData),
+                  let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                continue
+            }
+
+            if cgImage.width > canvasWidth {
+                canvasWidth = cgImage.width
+                canvasHeight = cgImage.height
+            }
+        }
+
+        // Fallback to first image if scanning failed
+        guard canvasWidth > 0 && canvasHeight > 0 else {
+            throw VideoProcessingError.invalidImageData
+        }
+
+        // Ensure even dimensions for H.264 codec
+        canvasWidth = makeEven(canvasWidth)
+        canvasHeight = makeEven(canvasHeight)
+
+        let width = canvasWidth
+        let height = canvasHeight
+
+        // Ensure output directory exists
+        let outputDir = outputURL.deletingLastPathComponent()
+        if !fileManager.fileExists(atPath: outputDir.path) {
+            try? fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        }
+        if fileManager.fileExists(atPath: outputURL.path) {
+            try? fileManager.removeItem(at: outputURL)
+        }
+
+        // 2. Setup AVAssetWriter for H.264 video
+        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
+            throw VideoProcessingError.assetWriterCreationFailed(nil)
+        }
+
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 2_000_000,  // 2 Mbps
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: fps * 10  // Keyframe every 10 seconds
+            ]
+        ]
+
+        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        writerInput.expectsMediaDataInRealTime = false
+
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: writerInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ]
+        )
+
+        guard writer.canAdd(writerInput) else {
+            throw VideoProcessingError.assetWriterInputCreationFailed
+        }
+        writer.add(writerInput)
+
+        guard writer.startWriting() else {
+            throw VideoProcessingError.assetWriterStartFailed(writer.error)
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // 3. Write each screenshot as a frame
+        var frameIndex = 0
+        let baseTimestamp = screenshots.first!.capturedAt
+
+        for screenshot in screenshots {
+            // Load image
+            guard let imageData = try? Data(contentsOf: screenshot.fileURL),
+                  let nsImage = NSImage(data: imageData),
+                  let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                print("⚠️ Skipping invalid image: \(screenshot.fileURL.lastPathComponent)")
+                continue
+            }
+
+            // Create pixel buffer with aspect-fit compositing (letterbox/pillarbox as needed)
+            guard let pixelBuffer = createPixelBuffer(from: cgImage, canvasWidth: width, canvasHeight: height) else {
+                print("⚠️ Failed to create pixel buffer for: \(screenshot.fileURL.lastPathComponent)")
+                continue
+            }
+
+            // Calculate presentation time
+            let presentationTime: CMTime
+            if useCompressedTimeline {
+                // Compressed: each frame is 1/fps seconds apart
+                // e.g., fps=2 means each frame is 0.5s apart (2 frames per second)
+                let frameTime = Double(frameIndex) / Double(fps)
+                presentationTime = CMTime(seconds: frameTime, preferredTimescale: 600)
+            } else {
+                // Real timeline: use actual capture timestamps
+                let elapsedSeconds = Double(screenshot.capturedAt - baseTimestamp)
+                presentationTime = CMTime(seconds: elapsedSeconds, preferredTimescale: 600)
+            }
+
+            // Wait for writer to be ready
+            while !writerInput.isReadyForMoreMediaData {
+                try await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            }
+
+            // Append frame
+            if !adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
+                print("⚠️ Failed to append frame at \(CMTimeGetSeconds(presentationTime))s")
+            }
+            frameIndex += 1
+        }
+
+        // 4. Finish writing
+        writerInput.markAsFinished()
+
+        await withCheckedContinuation { continuation in
+            writer.finishWriting {
+                continuation.resume()
+            }
+        }
+
+        guard writer.status == .completed else {
+            print("Screenshot compositing failed. Status: \(writer.status). Error: \(writer.error?.localizedDescription ?? "nil")")
+            throw VideoProcessingError.exportFailed(writer.error)
+        }
+
+        let videoDuration = useCompressedTimeline ? frameIndex : (screenshots.last!.capturedAt - baseTimestamp)
+        print("✅ Generated \(useCompressedTimeline ? "compressed" : "realtime") video from \(frameIndex) screenshots (\(videoDuration)s): \(outputURL.lastPathComponent)")
+    }
+
+    /// Overload that accepts file URLs directly (convenience for legacy code paths)
+    func generateVideoFromScreenshots(
+        screenshotURLs: [URL],
+        outputURL: URL,
+        fps: Int = 10
+    ) async throws {
+        // Convert URLs to Screenshot-like objects with estimated timestamps
+        // This is less accurate but works for cases where we only have URLs
+        var screenshots: [Screenshot] = []
+        let baseTimestamp = Int(Date().timeIntervalSince1970) - (screenshotURLs.count * 10) // Estimate
+
+        for (index, url) in screenshotURLs.enumerated() {
+            // Try to parse timestamp from filename (YYYYMMDD_HHmmssSSS.jpg)
+            let filename = url.deletingPathExtension().lastPathComponent
+            let timestamp: Int
+            if let parsed = parseTimestampFromFilename(filename) {
+                timestamp = parsed
+            } else {
+                timestamp = baseTimestamp + (index * 10) // Fall back to estimated
+            }
+
+            screenshots.append(Screenshot(
+                id: Int64(index),
+                capturedAt: timestamp,
+                filePath: url.path,
+                fileSize: nil,
+                isDeleted: false
+            ))
+        }
+
+        try await generateVideoFromScreenshots(screenshots: screenshots, outputURL: outputURL, fps: fps)
+    }
+
+    private func parseTimestampFromFilename(_ filename: String) -> Int? {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmssSSS"
+        if let date = formatter.date(from: filename) {
+            return Int(date.timeIntervalSince1970)
+        }
+        return nil
+    }
+
+    /// Creates a pixel buffer with the image composited onto a canvas using aspect-fit.
+    /// The image is centered and letterboxed/pillarboxed with black if aspect ratios differ.
+    private func createPixelBuffer(from cgImage: CGImage, canvasWidth: Int, canvasHeight: Int) -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+
+        let attrs: [String: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey as String: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
+        ]
+
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            canvasWidth,
+            canvasHeight,
+            kCVPixelFormatType_32ARGB,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
+
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: canvasWidth,
+            height: canvasHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+        ) else {
+            return nil
+        }
+
+        // Fill with black (letterbox/pillarbox background)
+        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight))
+
+        // Calculate aspect-fit scaling to center the image without distortion
+        let imageWidth = CGFloat(cgImage.width)
+        let imageHeight = CGFloat(cgImage.height)
+        let canvasW = CGFloat(canvasWidth)
+        let canvasH = CGFloat(canvasHeight)
+
+        let scaleX = canvasW / imageWidth
+        let scaleY = canvasH / imageHeight
+        let scale = min(scaleX, scaleY)  // Aspect-fit: use smaller scale to fit entirely
+
+        let scaledWidth = imageWidth * scale
+        let scaledHeight = imageHeight * scale
+        let offsetX = (canvasW - scaledWidth) / 2.0
+        let offsetY = (canvasH - scaledHeight) / 2.0
+
+        // Draw the image centered and scaled
+        context.draw(cgImage, in: CGRect(x: offsetX, y: offsetY, width: scaledWidth, height: scaledHeight))
+
+        return buffer
     }
 }

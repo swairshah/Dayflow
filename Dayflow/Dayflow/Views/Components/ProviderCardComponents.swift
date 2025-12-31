@@ -25,10 +25,11 @@ struct FlexibleProviderCard: View {
     let isSelected: Bool
     let buttonMode: ProviderCardButtonMode
     let showCurrentlySelected: Bool
+    let customStatusText: String?
     let onSelect: (() -> Void)?
-    
+
     private let isComingSoon: Bool
-    
+
     init(
         id: String,
         title: String,
@@ -39,6 +40,7 @@ struct FlexibleProviderCard: View {
         isSelected: Bool,
         buttonMode: ProviderCardButtonMode,
         showCurrentlySelected: Bool = false,
+        customStatusText: String? = nil,
         onSelect: (() -> Void)? = nil
     ) {
         self.id = id
@@ -50,6 +52,7 @@ struct FlexibleProviderCard: View {
         self.isSelected = isSelected
         self.buttonMode = buttonMode
         self.showCurrentlySelected = showCurrentlySelected
+        self.customStatusText = customStatusText
         self.onSelect = onSelect
         self.isComingSoon = id == "dayflow"
     }
@@ -154,7 +157,7 @@ struct FlexibleProviderCard: View {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 12))
                         .foregroundColor(.green)
-                    Text("Currently selected")
+                    Text(customStatusText ?? "Currently selected")
                         .font(.custom("Nunito", size: 12))
                         .fontWeight(.medium)
                         .foregroundColor(.black.opacity(0.6))
@@ -211,7 +214,7 @@ struct FlexibleProviderCard: View {
         case .onboarding(let onProceed):
             return { if !isComingSoon { onProceed() } }
         case .settings(let onSwitch):
-            return { if !isComingSoon && !isSelected { onSwitch() } }
+            return { if !isComingSoon { onSwitch() } }  // Removed !isSelected check - allow editing
         }
     }
     
@@ -219,12 +222,12 @@ struct FlexibleProviderCard: View {
         if isComingSoon {
             return "Coming Soon"
         }
-        
+
         switch buttonMode {
         case .onboarding:
             return "Proceed"
         case .settings:
-            return isSelected ? "Currently Active" : "Switch"
+            return isSelected ? "Edit Configuration" : "Switch"
         }
     }
     
@@ -232,12 +235,12 @@ struct FlexibleProviderCard: View {
         if isComingSoon {
             return true
         }
-        
+
         switch buttonMode {
         case .onboarding:
             return false
         case .settings:
-            return isSelected
+            return false  // Always enabled - allows editing when selected
         }
     }
     
@@ -404,7 +407,51 @@ struct ProviderIconView: View {
     let icon: String
     
     var body: some View {
-        Image(systemName: icon)
+        iconContent
+            .frame(width: containerWidth, height: 40)
+    }
+
+    private var containerWidth: CGFloat {
+        icon == "chatgpt_claude_asset" ? 104 : 40
+    }
+
+    @ViewBuilder
+    private var iconContent: some View {
+        switch icon {
+        case "gemini_asset":
+            logoBox(name: "GeminiLogo")
+        case "chatgpt_claude_asset":
+            HStack(spacing: 8) {
+                logoBox(name: "ChatGPTLogo")
+                logoBox(name: "ClaudeLogo")
+            }
+        default:
+            logoBox(systemName: icon)
+        }
+    }
+
+    @ViewBuilder
+    private func logoBox(name: String) -> some View {
+        Image(name)
+            .resizable()
+            .renderingMode(.original)
+            .interpolation(.high)
+            .antialiased(true)
+            .scaledToFit()
+            .frame(width: 28, height: 28)
+            .padding(6)
+            .background(.white.opacity(0.9))
+            .cornerRadius(6)
+            .shadow(color: Color.black.opacity(0.05), radius: 2, x: 0, y: 2)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.black.opacity(0.05), lineWidth: 0.5)
+            )
+    }
+
+    @ViewBuilder
+    private func logoBox(systemName: String) -> some View {
+        Image(systemName: systemName)
             .font(.system(size: 20, weight: .medium))
             .foregroundColor(.black.opacity(0.7))
             .frame(width: 40, height: 40)

@@ -11,6 +11,10 @@ final class SilentUserDriver: NSObject, SPUUserDriver {
             automaticUpdateDownloading: NSNumber(value: true),
             sendSystemProfile: false
         )
+        AnalyticsService.shared.capture("sparkle_permission_requested", [
+            "automatic_checks": true,
+            "automatic_downloads": true
+        ])
         reply(response)
     }
 
@@ -19,7 +23,7 @@ final class SilentUserDriver: NSObject, SPUUserDriver {
     }
 
     func showUpdateFound(with appcastItem: SUAppcastItem, state: SPUUserUpdateState, reply: @escaping (SPUUserUpdateChoice) -> Void) {
-        print("[Sparkle] Update found: \(appcastItem.displayVersionString ?? appcastItem.versionString)")
+        print("[Sparkle] Update found: \(appcastItem.displayVersionString)")
         // Always proceed to install
         reply(.install)
     }
@@ -37,6 +41,11 @@ final class SilentUserDriver: NSObject, SPUUserDriver {
     }
 
     func showUpdaterError(_ error: Error, acknowledgement: @escaping () -> Void) {
+        let nsError = error as NSError
+        AnalyticsService.shared.capture("sparkle_user_driver_error", [
+            "domain": nsError.domain,
+            "code": nsError.code
+        ])
         acknowledgement()
     }
 
@@ -62,9 +71,9 @@ final class SilentUserDriver: NSObject, SPUUserDriver {
 
     func showReady(toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void) {
         print("[Sparkle] Ready to install; allowing termination")
-        // Allow app termination for install and relaunch on the main actor
         Task { @MainActor in
             AppDelegate.allowTermination = true
+            AnalyticsService.shared.capture("sparkle_install_ready")
             reply(.install)
         }
     }
@@ -75,6 +84,9 @@ final class SilentUserDriver: NSObject, SPUUserDriver {
 
     func showUpdateInstalledAndRelaunched(_ relaunched: Bool, acknowledgement: @escaping () -> Void) {
         print("[Sparkle] Update installed; relaunched=\(relaunched)")
+        AnalyticsService.shared.capture("sparkle_install_completed", [
+            "relaunched": relaunched
+        ])
         acknowledgement()
     }
 

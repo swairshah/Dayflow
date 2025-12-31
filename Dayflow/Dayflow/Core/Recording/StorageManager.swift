@@ -2,33 +2,18 @@
 //  StorageManager.swift
 //  Dayflow
 //
-//  Created by Jerry Liu on 4/26/25.
-//  Revised 5/1/25 – remove @MainActor isolation so callers from background
-//  queues/Swift concurrency contexts can access the API without "MainActor"
-//  hops.  All GRDB work is already serialized internally via `DatabaseQueue`,
-//  so thread‑safety is preserved.
-//
 
 import Foundation
 import GRDB
+import Sentry
 
-// Helper DateFormatter (can be static var in an extension or class)
 extension DateFormatter {
     static let yyyyMMdd: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
-        // Using current time zone. Consider UTC if needed for absolute consistency.
         formatter.timeZone = Calendar.current.timeZone
         return formatter
     }()
-
-    // Add ISO8601 formatter if needed for parsing Gemini strings elsewhere
-    // Example:
-    // static let iso8601Full: ISO8601DateFormatter = {
-    //     let formatter = ISO8601DateFormatter()
-    //     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    //     return formatter
-    // }()
 }
 
 extension Date {
@@ -89,7 +74,20 @@ protocol StorageManaging: Sendable {
     // Timeline Queries
     func fetchTimelineCards(forDay day: String) -> [TimelineCard]
     func fetchTimelineCardsByTimeRange(from: Date, to: Date) -> [TimelineCard]
+    func fetchTotalMinutesTrackedForWeek(containing date: Date) -> Double
     func replaceTimelineCardsInRange(from: Date, to: Date, with: [TimelineCardShell], batchId: Int64) -> (insertedIds: [Int64], deletedVideoPaths: [String])
+    func fetchRecentTimelineCardsForDebug(limit: Int) -> [TimelineCardDebugEntry]
+
+    func updateTimelineCardCategory(cardId: Int64, category: String)
+
+    // Timeline review ratings (time-based)
+    func fetchReviewRatingSegments(overlapping startTs: Int, endTs: Int) -> [TimelineReviewRatingSegment]
+    func applyReviewRating(startTs: Int, endTs: Int, rating: String)
+    func fetchUnreviewedTimelineCardCount(forDay day: String, coverageThreshold: Double) -> Int
+
+    func fetchRecentLLMCallsForDebug(limit: Int) -> [LLMCallDebugEntry]
+    func fetchRecentAnalysisBatchesForDebug(limit: Int) -> [AnalysisBatchDebugEntry]
+    func fetchLLMCallsForBatches(batchIds: [Int64], limit: Int) -> [LLMCallDebugEntry]
 
     // Note: Transcript storage methods removed in favor of Observations
     
@@ -104,17 +102,77 @@ protocol StorageManaging: Sendable {
     
     // Reprocessing Methods
     func deleteTimelineCards(forDay day: String) -> [String]  // Returns video paths to clean up
+    func deleteTimelineCards(forBatchIds batchIds: [Int64]) -> [String]
     func deleteObservations(forBatchIds batchIds: [Int64])
     func resetBatchStatuses(forDay day: String) -> [Int64]  // Returns affected batch IDs
+    func resetBatchStatuses(forBatchIds batchIds: [Int64]) -> [Int64]
     func fetchBatches(forDay day: String) -> [(id: Int64, startTs: Int, endTs: Int, status: String)]
 
     /// Chunks that belong to one batch, already sorted.
     func chunksForBatch(_ batchId: Int64) -> [RecordingChunk]
-    
+
     /// All batches, newest first
     func allBatches() -> [(id: Int64, start: Int, end: Int, status: String)]
+
+    // MARK: - Screenshot Management (new - replaces video chunks)
+
+    /// Returns the next screenshot file URL (.jpg)
+    func nextScreenshotURL() -> URL
+
+    /// Save a screenshot to the database, returns the screenshot ID
+    func saveScreenshot(url: URL, capturedAt: Date) -> Int64?
+
+    /// Fetch screenshots that haven't been assigned to a batch yet
+    func fetchUnprocessedScreenshots(since oldestTimestamp: Int) -> [Screenshot]
+
+    /// Create a batch from screenshots, returns batch ID
+    func saveBatchWithScreenshots(startTs: Int, endTs: Int, screenshotIds: [Int64]) -> Int64?
+
+    /// Screenshots that belong to one batch, sorted by capture time
+    func screenshotsForBatch(_ batchId: Int64) -> [Screenshot]
+
+    /// Fetch screenshots within a time range (for timelapse generation)
+    func fetchScreenshotsInTimeRange(startTs: Int, endTs: Int) -> [Screenshot]
 }
 
+
+// Journal entry for daily intentions, reflections, and AI summaries
+struct JournalEntry: Codable, Sendable {
+    var id: Int64?
+    var day: String                    // "2025-01-15" format (4AM boundary)
+    var intentions: String?            // Morning intentions
+    var notes: String?                 // Additional notes
+    var goals: String?                 // Long-term goals
+    var reflections: String?           // Evening reflection
+    var summary: String?               // AI-generated summary
+    var status: String                 // "draft", "intentions_set", "complete"
+    var createdAt: Date?
+    var updatedAt: Date?
+
+    init(
+        id: Int64? = nil,
+        day: String,
+        intentions: String? = nil,
+        notes: String? = nil,
+        goals: String? = nil,
+        reflections: String? = nil,
+        summary: String? = nil,
+        status: String = "draft",
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil
+    ) {
+        self.id = id
+        self.day = day
+        self.intentions = intentions
+        self.notes = notes
+        self.goals = goals
+        self.reflections = reflections
+        self.summary = summary
+        self.status = status
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+}
 
 // NEW: Observation struct for first-class transcript storage
 struct Observation: Codable, Sendable {
@@ -168,6 +226,8 @@ struct Distraction: Codable, Sendable, Identifiable {
 
 struct TimelineCard: Codable, Sendable, Identifiable {
     var id = UUID()
+    let recordId: Int64?
+    let batchId: Int64? // Tracks source batch for retry functionality
     let startTimestamp: String
     let endTimestamp: String
     let category: String
@@ -212,6 +272,44 @@ struct LLMCallDBRecord: Sendable {
     let errorMessage: String?
 }
 
+struct TimelineCardDebugEntry: Sendable {
+    let createdAt: Date?
+    let batchId: Int64?
+    let day: String
+    let startTime: String
+    let endTime: String
+    let category: String
+    let subcategory: String?
+    let title: String
+    let summary: String?
+    let detailedSummary: String?
+}
+
+struct TimelineReviewRatingSegment: Sendable {
+    let id: Int64
+    let startTs: Int
+    let endTs: Int
+    let rating: String
+}
+
+struct LLMCallDebugEntry: Sendable {
+    let createdAt: Date?
+    let batchId: Int64?
+    let callGroupId: String?
+    let attempt: Int
+    let provider: String
+    let model: String?
+    let operation: String
+    let status: String
+    let latencyMs: Int?
+    let httpStatus: Int?
+    let requestMethod: String?
+    let requestURL: String?
+    let requestBody: String?
+    let responseBody: String?
+    let errorMessage: String?
+}
+
 // Add TimelineCardShell struct for the new save function
 struct TimelineCardShell: Sendable {
     let startTimestamp: String
@@ -231,6 +329,15 @@ struct TimelineCardShell: Sendable {
 private struct TimelineMetadata: Codable {
     let distractions: [Distraction]?
     let appSites: AppSites?
+}
+
+struct AnalysisBatchDebugEntry: Sendable {
+    let id: Int64
+    let status: String
+    let startTs: Int
+    let endTs: Int
+    let createdAt: Date?
+    let reason: String?
 }
 
 // Extended TimelineCard with timestamp fields for internal use
@@ -254,26 +361,211 @@ struct TimelineCardWithTimestamps {
 final class StorageManager: StorageManaging, @unchecked Sendable {
     static let shared = StorageManager()
 
-    private let db: DatabaseQueue
+    private let dbURL: URL
+    private var db: DatabasePool!  // var to allow recovery reassignment
     private let fileMgr = FileManager.default
     private let root: URL
-    private let quota = 5 * 1024 * 1024 * 1024  // 5 GB
+    private let backupsDir: URL
     var recordingsRoot: URL { root }
 
-    private init() {
-        root = fileMgr.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Dayflow/recordings", isDirectory: true)
-        
-        // Ensure directory exists
-        try? fileMgr.createDirectory(at: root, withIntermediateDirectories: true)
+    // TEMPORARY DEBUG: Remove after identifying slow queries
+    private let debugSlowQueries = true
+    private let slowThresholdMs: Double = 100  // Log anything over 100ms
 
-        db = try! DatabaseQueue(path: root.appendingPathComponent("chunks.sqlite").path)
+    // Dedicated queue for database writes to prevent main thread blocking
+    private let dbWriteQueue = DispatchQueue(label: "com.dayflow.storage.writes", qos: .utility)
+
+    private init() {
+        UserDefaultsMigrator.migrateIfNeeded()
+        StoragePathMigrator.migrateIfNeeded()
+
+        let appSupport = fileMgr.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let baseDir = appSupport.appendingPathComponent("Dayflow", isDirectory: true)
+        let recordingsDir = baseDir.appendingPathComponent("recordings", isDirectory: true)
+        let backupDir = baseDir.appendingPathComponent("backups", isDirectory: true)
+
+        // Ensure directories exist before opening database
+        try? fileMgr.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        try? fileMgr.createDirectory(at: recordingsDir, withIntermediateDirectories: true)
+        try? fileMgr.createDirectory(at: backupDir, withIntermediateDirectories: true)
+
+        root = recordingsDir
+        backupsDir = backupDir
+        dbURL = baseDir.appendingPathComponent("chunks.sqlite")
+
+        StorageManager.migrateDatabaseLocationIfNeeded(
+            fileManager: fileMgr,
+            legacyRecordingsDir: recordingsDir,
+            newDatabaseURL: dbURL
+        )
+
+        // Configure database with WAL mode for better performance and safety
+        var config = Configuration()
+        config.maximumReaderCount = 5
+        config.prepareDatabase { db in
+            if !db.configuration.readonly {
+                try db.execute(sql: "PRAGMA journal_mode = WAL")
+                try db.execute(sql: "PRAGMA synchronous = NORMAL")
+            }
+            try db.execute(sql: "PRAGMA busy_timeout = 5000")
+        }
+
+        // Safe database initialization with automatic recovery from backup
+        db = Self.openDatabaseSafely(
+            at: dbURL,
+            backupsDir: backupDir,
+            config: config,
+            fileManager: fileMgr
+        )
+
+        // TEMPORARY DEBUG: SQL statement tracing (via configuration)
+        #if DEBUG
+        try? db.write { db in
+            db.trace { event in
+                if case .profile(let statement, let duration) = event, duration > 0.1 {
+                    print("📊 SLOW SQL (\(Int(duration * 1000))ms): \(statement)")
+                }
+            }
+        }
+        #endif
+
+        // Run integrity check on launch (logs warning if issues found)
+        performIntegrityCheck()
+
         migrate()
+        migrateLegacyChunkPathsIfNeeded()
+
+        // Run initial purge, then schedule hourly
         purgeIfNeeded()
+        TimelapseStorageManager.shared.purgeIfNeeded()
+        startPurgeScheduler()
+
+        // Schedule WAL checkpoints every 5 minutes to prevent data loss
+        startCheckpointScheduler()
+
+        // Schedule daily backups
+        startBackupScheduler()
+    }
+
+    // TEMPORARY DEBUG: Timing helpers for database operations
+    private func timedWrite<T>(_ label: String, _ block: (Database) throws -> T) throws -> T {
+        let callStart = CFAbsoluteTimeGetCurrent()
+        var execStart: CFAbsoluteTime = 0
+        var execEnd: CFAbsoluteTime = 0
+
+        let writeBreadcrumb = Breadcrumb(level: .debug, category: "database")
+        writeBreadcrumb.message = "DB write: \(label)"
+        writeBreadcrumb.type = "debug"
+        SentryHelper.addBreadcrumb(writeBreadcrumb)
+
+        do {
+            let result = try db.write { db in
+                execStart = CFAbsoluteTimeGetCurrent()
+                defer { execEnd = CFAbsoluteTimeGetCurrent() }
+                return try block(db)
+            }
+
+            let waitMs = max(0, (execStart - callStart) * 1000)
+            let execMs = max(0, (execEnd - execStart) * 1000)
+
+            if debugSlowQueries && (execMs > slowThresholdMs || waitMs > slowThresholdMs) {
+                print("⚠️ SLOW WRITE [\(label)]: wait=\(Int(waitMs))ms exec=\(Int(execMs))ms")
+
+                let slowWriteBreadcrumb = Breadcrumb(level: .warning, category: "database")
+                slowWriteBreadcrumb.message = "SLOW DB write: \(label)"
+                slowWriteBreadcrumb.data = [
+                    "duration_ms": Int((waitMs + execMs).rounded()),
+                    "wait_ms": Int(waitMs.rounded()),
+                    "exec_ms": Int(execMs.rounded())
+                ]
+                slowWriteBreadcrumb.type = "error"
+                SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+            }
+
+            return result
+        } catch {
+            if execStart == 0 {
+                execStart = CFAbsoluteTimeGetCurrent()
+            }
+            if execEnd == 0 {
+                execEnd = CFAbsoluteTimeGetCurrent()
+            }
+            let waitMs = max(0, (execStart - callStart) * 1000)
+            let execMs = max(0, (execEnd - execStart) * 1000)
+
+            let slowWriteBreadcrumb = Breadcrumb(level: .error, category: "database")
+            slowWriteBreadcrumb.message = "FAILED DB write: \(label)"
+            slowWriteBreadcrumb.data = [
+                "wait_ms": Int(waitMs.rounded()),
+                "exec_ms": Int(execMs.rounded()),
+                "error": "\(error)"
+            ]
+            slowWriteBreadcrumb.type = "error"
+            SentryHelper.addBreadcrumb(slowWriteBreadcrumb)
+            throw error
+        }
+    }
+
+    private func timedRead<T>(_ label: String, _ block: (Database) throws -> T) throws -> T {
+        let callStart = CFAbsoluteTimeGetCurrent()
+        var execStart: CFAbsoluteTime = 0
+        var execEnd: CFAbsoluteTime = 0
+
+        let readBreadcrumb = Breadcrumb(level: .debug, category: "database")
+        readBreadcrumb.message = "DB read: \(label)"
+        readBreadcrumb.type = "debug"
+        SentryHelper.addBreadcrumb(readBreadcrumb)
+
+        do {
+            let result = try db.read { db in
+                execStart = CFAbsoluteTimeGetCurrent()
+                defer { execEnd = CFAbsoluteTimeGetCurrent() }
+                return try block(db)
+            }
+
+            let waitMs = max(0, (execStart - callStart) * 1000)
+            let execMs = max(0, (execEnd - execStart) * 1000)
+
+            if debugSlowQueries && (execMs > slowThresholdMs || waitMs > slowThresholdMs) {
+                print("⚠️ SLOW READ [\(label)]: wait=\(Int(waitMs))ms exec=\(Int(execMs))ms")
+
+                let slowReadBreadcrumb = Breadcrumb(level: .warning, category: "database")
+                slowReadBreadcrumb.message = "SLOW DB read: \(label)"
+                slowReadBreadcrumb.data = [
+                    "duration_ms": Int((waitMs + execMs).rounded()),
+                    "wait_ms": Int(waitMs.rounded()),
+                    "exec_ms": Int(execMs.rounded())
+                ]
+                slowReadBreadcrumb.type = "error"
+                SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+            }
+
+            return result
+        } catch {
+            if execStart == 0 {
+                execStart = CFAbsoluteTimeGetCurrent()
+            }
+            if execEnd == 0 {
+                execEnd = CFAbsoluteTimeGetCurrent()
+            }
+            let waitMs = max(0, (execStart - callStart) * 1000)
+            let execMs = max(0, (execEnd - execStart) * 1000)
+
+            let slowReadBreadcrumb = Breadcrumb(level: .error, category: "database")
+            slowReadBreadcrumb.message = "FAILED DB read: \(label)"
+            slowReadBreadcrumb.data = [
+                "wait_ms": Int(waitMs.rounded()),
+                "exec_ms": Int(execMs.rounded()),
+                "error": "\(error)"
+            ]
+            slowReadBreadcrumb.type = "error"
+            SentryHelper.addBreadcrumb(slowReadBreadcrumb)
+            throw error
+        }
     }
 
     private func migrate() {
-        try? db.write { db in
+        try? timedWrite("migrate") { db in
             // Create all tables with their final schema
             try db.execute(sql: """
                 -- Chunks table: stores video recording segments
@@ -287,6 +579,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 );
                 CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
                 CREATE INDEX IF NOT EXISTS idx_chunks_start_ts ON chunks(start_ts);
+                CREATE INDEX IF NOT EXISTS idx_chunks_status_start_ts ON chunks(status, start_ts);
                 
                 -- Analysis batches: groups chunks for LLM processing
                 CREATE TABLE IF NOT EXISTS analysis_batches (
@@ -307,6 +600,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                     chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE RESTRICT,
                     PRIMARY KEY (batch_id, chunk_id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_batch_chunks_chunk ON batch_chunks(chunk_id);
                 
                 -- Timeline cards: stores activity summaries
                 CREATE TABLE IF NOT EXISTS timeline_cards (
@@ -329,6 +623,15 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 CREATE INDEX IF NOT EXISTS idx_timeline_cards_day ON timeline_cards(day);
                 CREATE INDEX IF NOT EXISTS idx_timeline_cards_start_ts ON timeline_cards(start_ts);
                 CREATE INDEX IF NOT EXISTS idx_timeline_cards_time_range ON timeline_cards(start_ts, end_ts);
+
+                -- Timeline review ratings: stores time-based review segments
+                CREATE TABLE IF NOT EXISTS timeline_review_ratings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_ts INTEGER NOT NULL,
+                    end_ts INTEGER NOT NULL,
+                    rating TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_ratings_time ON timeline_review_ratings(start_ts, end_ts);
                 
                 -- Observations: stores LLM transcription outputs
                 CREATE TABLE IF NOT EXISTS observations (
@@ -344,6 +647,43 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 CREATE INDEX IF NOT EXISTS idx_observations_batch_id ON observations(batch_id);
                 CREATE INDEX IF NOT EXISTS idx_observations_start_ts ON observations(start_ts);
                 CREATE INDEX IF NOT EXISTS idx_observations_time_range ON observations(start_ts, end_ts);
+
+                -- Screenshots table: stores periodic screen captures (replaces video chunks)
+                CREATE TABLE IF NOT EXISTS screenshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    captured_at INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER,
+                    is_deleted INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_screenshots_captured_at ON screenshots(captured_at);
+
+                -- Junction table linking batches to screenshots
+                CREATE TABLE IF NOT EXISTS batch_screenshots (
+                    batch_id INTEGER NOT NULL REFERENCES analysis_batches(id) ON DELETE CASCADE,
+                    screenshot_id INTEGER NOT NULL REFERENCES screenshots(id) ON DELETE RESTRICT,
+                    PRIMARY KEY (batch_id, screenshot_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_batch_screenshots_screenshot ON batch_screenshots(screenshot_id);
+            """)
+
+            // Journal entries table: stores daily intentions, reflections, and summaries
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS journal_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    day TEXT NOT NULL UNIQUE,
+                    intentions TEXT,
+                    notes TEXT,
+                    goals TEXT,
+                    reflections TEXT,
+                    summary TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_journal_entries_day ON journal_entries(day);
+                CREATE INDEX IF NOT EXISTS idx_journal_entries_status ON journal_entries(status);
             """)
 
             // LLM calls logging table
@@ -374,6 +714,29 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_group ON llm_calls(call_group_id, attempt);
                 CREATE INDEX IF NOT EXISTS idx_llm_calls_batch ON llm_calls(batch_id);
             """)
+
+            // Migration: Add soft delete column to timeline_cards if it doesn't exist
+            let timelineCardsColumns = try db.columns(in: "timeline_cards").map { $0.name }
+            if !timelineCardsColumns.contains("is_deleted") {
+                try db.execute(sql: """
+                    ALTER TABLE timeline_cards ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0;
+                """)
+
+                // Create composite partial indexes for common query patterns
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_timeline_cards_active_start_ts
+                    ON timeline_cards(start_ts)
+                    WHERE is_deleted = 0;
+                """)
+
+                try db.execute(sql: """
+                    CREATE INDEX IF NOT EXISTS idx_timeline_cards_active_batch
+                    ON timeline_cards(batch_id)
+                    WHERE is_deleted = 0;
+                """)
+
+                print("✅ Added is_deleted column and composite indexes to timeline_cards")
+            }
         }
     }
 
@@ -385,35 +748,53 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
 
     func registerChunk(url: URL) {
         let ts = Int(Date().timeIntervalSince1970)
-        try? db.write { db in
-            try db.execute(sql: "INSERT INTO chunks(start_ts, end_ts, file_url, status) VALUES (?, ?, ?, 'recording')",
-                           arguments: [ts, ts + 60, url.path])
+        let path = url.path
+
+        // Perform database write asynchronously to avoid blocking caller thread
+        dbWriteQueue.async { [weak self] in
+            try? self?.timedWrite("registerChunk") { db in
+                try db.execute(sql: "INSERT INTO chunks(start_ts, end_ts, file_url, status) VALUES (?, ?, ?, 'recording')",
+                               arguments: [ts, ts + 60, path])
+            }
         }
-        purgeIfNeeded()
     }
 
     func markChunkCompleted(url: URL) {
         let end = Int(Date().timeIntervalSince1970)
-        try? db.write { db in
-            try db.execute(sql: "UPDATE chunks SET end_ts = ?, status = 'completed' WHERE file_url = ?",
-                           arguments: [end, url.path])
+        let path = url.path
+
+        // Perform database write asynchronously to avoid blocking caller thread
+        dbWriteQueue.async { [weak self] in
+            try? self?.timedWrite("markChunkCompleted") { db in
+                try db.execute(sql: "UPDATE chunks SET end_ts = ?, status = 'completed' WHERE file_url = ?",
+                               arguments: [end, path])
+            }
         }
     }
 
     func markChunkFailed(url: URL) {
-        try? db.write { db in
-            try db.execute(sql: "DELETE FROM chunks WHERE file_url = ?", arguments: [url.path])
+        let path = url.path
+
+        // Perform database write and file deletion asynchronously to avoid blocking caller thread
+        dbWriteQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            try? self.timedWrite("markChunkFailed") { db in
+                try db.execute(sql: "DELETE FROM chunks WHERE file_url = ?", arguments: [path])
+            }
+
+            try? self.fileMgr.removeItem(at: url)
         }
-        try? fileMgr.removeItem(at: url)
     }
 
 
     func fetchUnprocessedChunks(olderThan oldestAllowed: Int) -> [RecordingChunk] {
-        (try? db.read { db in
+        (try? timedRead("fetchUnprocessedChunks") { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM chunks
                 WHERE start_ts >= ?
                   AND status = 'completed'
+                  AND (is_deleted = 0 OR is_deleted IS NULL)
                   AND id NOT IN (SELECT chunk_id FROM batch_chunks)
                 ORDER BY start_ts ASC
             """, arguments: [oldestAllowed])
@@ -425,7 +806,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     func saveBatch(startTs: Int, endTs: Int, chunkIds: [Int64]) -> Int64? {
         guard !chunkIds.isEmpty else { return nil }
         var batchID: Int64 = 0
-        try? db.write { db in
+        try? timedWrite("saveBatch(\(chunkIds.count)_chunks)") { db in
             try db.execute(sql: "INSERT INTO analysis_batches(batch_start_ts, batch_end_ts) VALUES (?, ?)",
                            arguments: [startTs, endTs])
             batchID = db.lastInsertedRowID
@@ -437,14 +818,20 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     }
 
     func updateBatchStatus(batchId: Int64, status: String) {
-        try? db.write { db in
-            try db.execute(sql: "UPDATE analysis_batches SET status = ? WHERE id = ?", arguments: [status, batchId])
+        // Perform database write asynchronously to avoid blocking caller thread
+        dbWriteQueue.async { [weak self] in
+            try? self?.timedWrite("updateBatchStatus") { db in
+                try db.execute(sql: "UPDATE analysis_batches SET status = ? WHERE id = ?", arguments: [status, batchId])
+            }
         }
     }
 
     func markBatchFailed(batchId: Int64, reason: String) {
-        try? db.write { db in
-            try db.execute(sql: "UPDATE analysis_batches SET status = 'failed', reason = ? WHERE id = ?", arguments: [reason, batchId])
+        // Perform database write asynchronously to avoid blocking caller thread
+        dbWriteQueue.async { [weak self] in
+            try? self?.timedWrite("markBatchFailed") { db in
+                try db.execute(sql: "UPDATE analysis_batches SET status = 'failed', reason = ? WHERE id = ?", arguments: [reason, batchId])
+            }
         }
     }
 
@@ -452,7 +839,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(calls), let json = String(data: data, encoding: .utf8) else { return }
-        try? db.write { db in
+        try? timedWrite("updateBatchLLMMetadata") { db in
             try db.execute(sql: "UPDATE analysis_batches SET llm_metadata = ? WHERE id = ?", arguments: [json, batchId])
         }
     }
@@ -460,7 +847,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     func fetchBatchLLMMetadata(batchId: Int64) -> [LLMCall] {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? db.read { db in
+        return (try? timedRead("fetchBatchLLMMetadata") { db in
             if let row = try Row.fetchOne(db, sql: "SELECT llm_metadata FROM analysis_batches WHERE id = ?", arguments: [batchId]),
                let json: String = row["llm_metadata"],
                let data = json.data(using: .utf8) {
@@ -477,6 +864,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 SELECT c.* FROM batch_chunks bc
                 JOIN chunks c ON c.id = bc.chunk_id
                 WHERE bc.batch_id = ?
+                  AND (c.is_deleted = 0 OR c.is_deleted IS NULL)
                 ORDER BY c.start_ts ASC
                 """, arguments: [batchId]
             ).map { r in
@@ -485,14 +873,24 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
             }
         }) ?? []
     }
+
+    /// Helper to get the batch start timestamp for date calculations
+    private func getBatchStartTimestamp(batchId: Int64) -> Int? {
+        return try? db.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT batch_start_ts FROM analysis_batches WHERE id = ?
+            """, arguments: [batchId])
+        }
+    }
     
     /// Fetch chunks that overlap with a specific time range
     func fetchChunksInTimeRange(startTs: Int, endTs: Int) -> [RecordingChunk] {
-        (try? db.read { db in
+        (try? timedRead("fetchChunksInTimeRange") { db in
             try Row.fetchAll(db, sql: """
-                SELECT * FROM chunks 
+                SELECT * FROM chunks
                 WHERE status = 'completed'
-                  AND ((start_ts <= ? AND end_ts >= ?) 
+                  AND (is_deleted = 0 OR is_deleted IS NULL)
+                  AND ((start_ts <= ? AND end_ts >= ?)
                        OR (start_ts >= ? AND start_ts <= ?)
                        OR (end_ts >= ? AND end_ts <= ?))
                 ORDER BY start_ts ASC
@@ -504,59 +902,196 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         }) ?? []
     }
 
+    // MARK: - Screenshot Management (new - replaces video chunks)
+
+    func nextScreenshotURL() -> URL {
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd_HHmmssSSS"
+        return root.appendingPathComponent("\(df.string(from: Date())).jpg")
+    }
+
+    func saveScreenshot(url: URL, capturedAt: Date) -> Int64? {
+        let timestamp = Int(capturedAt.timeIntervalSince1970)
+        let path = url.path
+        let fileSize: Int64? = {
+            if let attrs = try? fileMgr.attributesOfItem(atPath: path),
+               let size = attrs[.size] as? NSNumber {
+                return size.int64Value
+            }
+            return nil
+        }()
+
+        var screenshotId: Int64?
+        try? timedWrite("saveScreenshot") { db in
+            try db.execute(sql: """
+                INSERT INTO screenshots(captured_at, file_path, file_size)
+                VALUES (?, ?, ?)
+            """, arguments: [timestamp, path, fileSize])
+            screenshotId = db.lastInsertedRowID
+        }
+        return screenshotId
+    }
+
+    func fetchUnprocessedScreenshots(since oldestTimestamp: Int) -> [Screenshot] {
+        (try? timedRead("fetchUnprocessedScreenshots") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT * FROM screenshots
+                WHERE captured_at >= ?
+                  AND is_deleted = 0
+                  AND id NOT IN (SELECT screenshot_id FROM batch_screenshots)
+                ORDER BY captured_at ASC
+            """, arguments: [oldestTimestamp])
+            .map { row in
+                Screenshot(
+                    id: row["id"],
+                    capturedAt: row["captured_at"],
+                    filePath: row["file_path"],
+                    fileSize: row["file_size"],
+                    isDeleted: (row["is_deleted"] as? Int ?? 0) != 0
+                )
+            }
+        }) ?? []
+    }
+
+    func saveBatchWithScreenshots(startTs: Int, endTs: Int, screenshotIds: [Int64]) -> Int64? {
+        guard !screenshotIds.isEmpty else { return nil }
+        var batchId: Int64 = 0
+
+        try? timedWrite("saveBatchWithScreenshots(\(screenshotIds.count))") { db in
+            try db.execute(sql: """
+                INSERT INTO analysis_batches(batch_start_ts, batch_end_ts)
+                VALUES (?, ?)
+            """, arguments: [startTs, endTs])
+            batchId = db.lastInsertedRowID
+
+            for id in screenshotIds {
+                try db.execute(sql: """
+                    INSERT INTO batch_screenshots(batch_id, screenshot_id)
+                    VALUES (?, ?)
+                """, arguments: [batchId, id])
+            }
+        }
+        return batchId == 0 ? nil : batchId
+    }
+
+    func screenshotsForBatch(_ batchId: Int64) -> [Screenshot] {
+        (try? timedRead("screenshotsForBatch") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT s.* FROM batch_screenshots bs
+                JOIN screenshots s ON s.id = bs.screenshot_id
+                WHERE bs.batch_id = ?
+                  AND s.is_deleted = 0
+                ORDER BY s.captured_at ASC
+            """, arguments: [batchId])
+            .map { row in
+                Screenshot(
+                    id: row["id"],
+                    capturedAt: row["captured_at"],
+                    filePath: row["file_path"],
+                    fileSize: row["file_size"],
+                    isDeleted: (row["is_deleted"] as? Int ?? 0) != 0
+                )
+            }
+        }) ?? []
+    }
+
+    func fetchScreenshotsInTimeRange(startTs: Int, endTs: Int) -> [Screenshot] {
+        (try? timedRead("fetchScreenshotsInTimeRange") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT * FROM screenshots
+                WHERE captured_at >= ? AND captured_at <= ?
+                  AND is_deleted = 0
+                ORDER BY captured_at ASC
+            """, arguments: [startTs, endTs])
+            .map { row in
+                Screenshot(
+                    id: row["id"],
+                    capturedAt: row["captured_at"],
+                    filePath: row["file_path"],
+                    fileSize: row["file_size"],
+                    isDeleted: (row["is_deleted"] as? Int ?? 0) != 0
+                )
+            }
+        }) ?? []
+    }
 
     func saveTimelineCardShell(batchId: Int64, card: TimelineCardShell) -> Int64? {
         let encoder = JSONEncoder()
         var lastId: Int64? = nil
-        
-        
+
+        // Get the batch's actual start timestamp to use as the base date
+        guard let batchStartTs = getBatchStartTimestamp(batchId: batchId) else {
+            return nil
+        }
+        let baseDate = Date(timeIntervalSince1970: TimeInterval(batchStartTs))
+
         let timeFormatter = DateFormatter()
         timeFormatter.dateFormat = "h:mm a"
         timeFormatter.locale = Locale(identifier: "en_US_POSIX")
-        
-        // Since we don't have the day anymore, use today's date as base
-        let baseDate = Date()
-        
+
         guard let startTime = timeFormatter.date(from: card.startTimestamp),
               let endTime = timeFormatter.date(from: card.endTimestamp) else {
             return nil
         }
-        
+
         let calendar = Calendar.current
-        
+
         let startComponents = calendar.dateComponents([.hour, .minute], from: startTime)
         guard let startHour = startComponents.hour, let startMinute = startComponents.minute else { return nil }
-        
+
         var startDate = calendar.date(bySettingHour: startHour, minute: startMinute, second: 0, of: baseDate) ?? baseDate
-        
-        // Handle day boundary for times after midnight
-        if startHour < 4 {
-            startDate = calendar.date(byAdding: .day, value: 1, to: startDate) ?? startDate
+
+        // If the parsed time is between midnight and 4 AM, and it's earlier than baseDate,
+        // disambiguate whether it's same day (before batch) or next day (after midnight crossing)
+        if startHour < 4 && startDate < baseDate {
+            let nextDayStartDate = calendar.date(byAdding: .day, value: 1, to: startDate) ?? startDate
+
+            // Pick whichever is closer to batch start time
+            let sameDayDistance = abs(startDate.timeIntervalSince(baseDate))
+            let nextDayDistance = abs(nextDayStartDate.timeIntervalSince(baseDate))
+
+            if nextDayDistance < sameDayDistance {
+                // Next day is closer - legitimate midnight crossing
+                startDate = nextDayStartDate
+            }
+            // Otherwise keep same day (LLM provided time before batch started)
         }
-        
+
         let startTs = Int(startDate.timeIntervalSince1970)
-        
+
         let endComponents = calendar.dateComponents([.hour, .minute], from: endTime)
         guard let endHour = endComponents.hour, let endMinute = endComponents.minute else { return nil }
-        
+
         var endDate = calendar.date(bySettingHour: endHour, minute: endMinute, second: 0, of: baseDate) ?? baseDate
-        
-        // Handle day boundary
-        if endHour < 4 || endDate < startDate {
+
+        // Disambiguate end time day using same logic as start time
+        if endHour < 4 && endDate < baseDate {
+            let nextDayEndDate = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
+
+            let sameDayDistance = abs(endDate.timeIntervalSince(baseDate))
+            let nextDayDistance = abs(nextDayEndDate.timeIntervalSince(baseDate))
+
+            if nextDayDistance < sameDayDistance {
+                endDate = nextDayEndDate
+            }
+        }
+
+        // Handle midnight crossing: if end time is before start time, it must be the next day
+        if endDate < startDate {
             endDate = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
         }
-        
+
         let endTs = Int(endDate.timeIntervalSince1970)
-        
-        try? db.write {
+
+        try? timedWrite("saveTimelineCardShell") {
             db in
             // Encode metadata as an object for forward-compatibility
             let meta = TimelineMetadata(distractions: card.distractions, appSites: card.appSites)
             let metadataString: String? = (try? encoder.encode(meta)).flatMap { String(data: $0, encoding: .utf8) }
 
-            // Calculate the day string from the start timestamp
-            let dayString = self.dateFormatter.string(from: startDate)
-            
+            // Calculate the day string using 4 AM boundary rules
+            let (dayString, _, _) = startDate.getDayInfoFor4AMBoundary()
+
             try db.execute(sql: """
                 INSERT INTO timeline_cards(
                     batch_id, start, end, start_ts, end_ts, day, title,
@@ -574,7 +1109,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     }
 
     func updateTimelineCardVideoURL(cardId: Int64, videoSummaryURL: String) {
-        try? db.write {
+        try? timedWrite("updateTimelineCardVideoURL") {
             db in
             try db.execute(sql: """
                 UPDATE timeline_cards
@@ -584,10 +1119,328 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         }
     }
 
+    func updateTimelineCardCategory(cardId: Int64, category: String) {
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+
+        try? timedWrite("updateTimelineCardCategory") { db in
+            try db.execute(sql: """
+                UPDATE timeline_cards
+                SET category = ?
+                WHERE id = ?
+            """, arguments: [trimmed, cardId])
+        }
+    }
+
+    func fetchReviewRatingSegments(overlapping startTs: Int, endTs: Int) -> [TimelineReviewRatingSegment] {
+        guard endTs > startTs else { return [] }
+
+        return (try? timedRead("fetchReviewRatingSegments") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT id, start_ts, end_ts, rating
+                FROM timeline_review_ratings
+                WHERE NOT (end_ts <= ? OR start_ts >= ?)
+                ORDER BY start_ts ASC
+            """, arguments: [startTs, endTs]).map { row in
+                TimelineReviewRatingSegment(
+                    id: row["id"],
+                    startTs: row["start_ts"],
+                    endTs: row["end_ts"],
+                    rating: row["rating"]
+                )
+            }
+        }) ?? []
+    }
+
+    func applyReviewRating(startTs: Int, endTs: Int, rating: String) {
+        guard endTs > startTs else { return }
+
+        try? timedWrite("applyReviewRating") { db in
+            let overlappingRows = try Row.fetchAll(db, sql: """
+                SELECT id, start_ts, end_ts, rating
+                FROM timeline_review_ratings
+                WHERE NOT (end_ts <= ? OR start_ts >= ?)
+                ORDER BY start_ts ASC
+            """, arguments: [startTs, endTs])
+
+            var deleteIds: [Int64] = []
+            var fragments: [(start: Int, end: Int, rating: String)] = []
+
+            for row in overlappingRows {
+                let id: Int64 = row["id"]
+                let existingStart: Int = row["start_ts"]
+                let existingEnd: Int = row["end_ts"]
+                let existingRating: String = row["rating"]
+
+                deleteIds.append(id)
+
+                if existingStart < startTs {
+                    let fragmentEnd = min(startTs, existingEnd)
+                    if fragmentEnd > existingStart {
+                        fragments.append((start: existingStart, end: fragmentEnd, rating: existingRating))
+                    }
+                }
+
+                if existingEnd > endTs {
+                    let fragmentStart = max(endTs, existingStart)
+                    if existingEnd > fragmentStart {
+                        fragments.append((start: fragmentStart, end: existingEnd, rating: existingRating))
+                    }
+                }
+            }
+
+            if deleteIds.isEmpty == false {
+                let placeholders = Array(repeating: "?", count: deleteIds.count).joined(separator: ",")
+                try db.execute(sql: """
+                    DELETE FROM timeline_review_ratings
+                    WHERE id IN (\(placeholders))
+                """, arguments: StatementArguments(deleteIds))
+            }
+
+            for fragment in fragments {
+                try db.execute(sql: """
+                    INSERT INTO timeline_review_ratings (start_ts, end_ts, rating)
+                    VALUES (?, ?, ?)
+                """, arguments: [fragment.start, fragment.end, fragment.rating])
+            }
+
+            try db.execute(sql: """
+                INSERT INTO timeline_review_ratings (start_ts, end_ts, rating)
+                VALUES (?, ?, ?)
+            """, arguments: [startTs, endTs, rating])
+        }
+    }
+
+    func fetchUnreviewedTimelineCardCount(forDay day: String, coverageThreshold: Double = 0.8) -> Int {
+        guard let dayDate = dateFormatter.date(from: day) else { return 0 }
+        let calendar = Calendar.current
+        guard let dayStart = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: dayDate) else { return 0 }
+        let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        let dayStartTs = Int(dayStart.timeIntervalSince1970)
+        let dayEndTs = Int(dayEnd.timeIntervalSince1970)
+
+        let cardFetch = (try? timedRead("fetchUnreviewedTimelineCardCount.cards") { db -> (cards: [(start: Int, end: Int)], invalidCount: Int) in
+            var invalidCount = 0
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT start_ts, end_ts, category
+                FROM timeline_cards
+                WHERE start_ts >= ? AND start_ts < ?
+                  AND is_deleted = 0
+            """, arguments: [dayStartTs, dayEndTs])
+            let cards = rows.compactMap { row -> (start: Int, end: Int)? in
+                let category: String = row["category"]
+                if category.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .caseInsensitiveCompare("System") == .orderedSame {
+                    return nil
+                }
+                guard let start: Int = row["start_ts"], let end: Int = row["end_ts"], end > start else {
+                    invalidCount += 1
+                    return nil
+                }
+                return (start: start, end: end)
+            }
+            return (cards, invalidCount)
+        })
+
+        let cards = cardFetch?.cards ?? []
+        var unreviewedCount = cardFetch?.invalidCount ?? 0
+
+        if cards.isEmpty {
+            return unreviewedCount
+        }
+
+        let ratingSegments = fetchReviewRatingSegments(overlapping: dayStartTs, endTs: dayEndTs)
+        let mergedSegments = mergeCoverageSegments(
+            segments: ratingSegments,
+            dayStartTs: dayStartTs,
+            dayEndTs: dayEndTs
+        )
+
+        let sortedCards = cards.sorted { $0.start < $1.start }
+        var segmentIndex = 0
+
+        for card in sortedCards {
+            let duration = card.end - card.start
+            if duration <= 0 { continue }
+
+            let covered = overlapSeconds(
+                start: card.start,
+                end: card.end,
+                segments: mergedSegments,
+                segmentIndex: &segmentIndex
+            )
+            let coverageRatio = Double(covered) / Double(duration)
+            if coverageRatio < coverageThreshold {
+                unreviewedCount += 1
+            }
+        }
+
+        return unreviewedCount
+    }
+
+    private func mergeCoverageSegments(
+        segments: [TimelineReviewRatingSegment],
+        dayStartTs: Int,
+        dayEndTs: Int
+    ) -> [(start: Int, end: Int)] {
+        var clipped: [(start: Int, end: Int)] = []
+        clipped.reserveCapacity(segments.count)
+
+        for segment in segments {
+            let start = max(segment.startTs, dayStartTs)
+            let end = min(segment.endTs, dayEndTs)
+            if end > start {
+                clipped.append((start: start, end: end))
+            }
+        }
+
+        guard clipped.isEmpty == false else { return [] }
+        clipped.sort { $0.start < $1.start }
+
+        var merged: [(start: Int, end: Int)] = [clipped[0]]
+        for segment in clipped.dropFirst() {
+            var last = merged[merged.count - 1]
+            if segment.start <= last.end {
+                last.end = max(last.end, segment.end)
+                merged[merged.count - 1] = last
+            } else {
+                merged.append(segment)
+            }
+        }
+        return merged
+    }
+
+    private func overlapSeconds(
+        start: Int,
+        end: Int,
+        segments: [(start: Int, end: Int)],
+        segmentIndex: inout Int
+    ) -> Int {
+        guard end > start else { return 0 }
+
+        while segmentIndex < segments.count, segments[segmentIndex].end <= start {
+            segmentIndex += 1
+        }
+
+        var covered = 0
+        var index = segmentIndex
+
+        while index < segments.count, segments[index].start < end {
+            let overlapStart = max(start, segments[index].start)
+            let overlapEnd = min(end, segments[index].end)
+            if overlapEnd > overlapStart {
+                covered += overlapEnd - overlapStart
+            }
+            if segments[index].end <= end {
+                index += 1
+            } else {
+                break
+            }
+        }
+
+        return covered
+    }
+
+    // MARK: - Onboarding Card
+
+    /// Creates a dummy "Installed Dayflow!" card when onboarding completes.
+    /// This gives users an immediate example of what cards look like.
+    func createOnboardingCard() {
+        let now = Date()
+        let startTime = now.addingTimeInterval(-13 * 60)  // 13 minute card
+
+        // Format times as "h:mm a" (e.g., "2:30 PM")
+        let timeFormatter = DateFormatter()
+        timeFormatter.dateFormat = "h:mm a"
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+
+        let startTimeString = timeFormatter.string(from: startTime)
+        let endTimeString = timeFormatter.string(from: now)
+
+        let startTs = Int(startTime.timeIntervalSince1970)
+        let endTs = Int(now.timeIntervalSince1970)
+
+        // Calculate day using 4AM boundary
+        let (dayString, _, _) = startTime.getDayInfoFor4AMBoundary()
+
+        // Get the first non-idle category, fallback to "Work"
+        let categories = CategoryPersistence.loadPersistedCategories()
+        let category = categories.first(where: { !$0.isIdle })?.name ?? "Work"
+
+        // Build summary based on selected LLM provider
+        let summary = buildOnboardingSummary()
+
+        // Build metadata with appSites
+        let encoder = JSONEncoder()
+        let meta = TimelineMetadata(
+            distractions: nil,
+            appSites: AppSites(primary: "dayflow.so", secondary: nil)
+        )
+        let metadataString: String? = (try? encoder.encode(meta)).flatMap { String(data: $0, encoding: .utf8) }
+
+        try? timedWrite("createOnboardingCard") { db in
+            try db.execute(sql: """
+                INSERT INTO timeline_cards(
+                    batch_id, start, end, start_ts, end_ts, day, title,
+                    summary, category, subcategory, detailed_summary, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, arguments: [
+                nil,  // batch_id is NULL for onboarding card
+                startTimeString,
+                endTimeString,
+                startTs,
+                endTs,
+                dayString,
+                "Installed Dayflow!",
+                summary,
+                category,
+                "Setup",
+                "",  // detailed_summary - empty string (not NULL, as GRDB decode expects non-optional)
+                metadataString
+            ])
+        }
+    }
+
+    private func buildOnboardingSummary() -> String {
+        let selectedProvider = UserDefaults.standard.string(forKey: "selectedLLMProvider") ?? "gemini"
+
+        switch selectedProvider {
+        case "gemini":
+            return "You successfully installed Dayflow and configured it with Gemini AI. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+
+        case "chatgpt_claude":
+            // Check which CLI tool they picked
+            let cliTool = UserDefaults.standard.string(forKey: "chatCLIPreferredTool") ?? "claude"
+            if cliTool == "codex" {
+                return "You successfully installed Dayflow with ChatGPT. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+            } else {
+                return "You successfully installed Dayflow with Claude. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+            }
+
+        case "ollama":
+            // Check which local engine they picked
+            let localEngine = UserDefaults.standard.string(forKey: "llmLocalEngine") ?? "ollama"
+            if localEngine == "lmstudio" {
+                return "You successfully installed Dayflow with LM Studio — your data stays 100% on your device. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+            } else {
+                return "You successfully installed Dayflow with Ollama — your data stays 100% on your device. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+            }
+
+        default:
+            return "You successfully installed Dayflow. Come back in 30 minutes to see your first real activity card! ✨ (This is a sample card, so you can see what your timeline will look like.)"
+        }
+    }
+
     func fetchTimelineCards(forBatch batchId: Int64) -> [TimelineCard] {
         let decoder = JSONDecoder()
-        return (try? db.read { db in
-            try Row.fetchAll(db, sql: "SELECT * FROM timeline_cards WHERE batch_id = ? ORDER BY start ASC", arguments: [batchId]).map { row in
+        return (try? timedRead("fetchTimelineCards(forBatch)") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT * FROM timeline_cards
+                WHERE batch_id = ?
+                  AND is_deleted = 0
+                ORDER BY start ASC
+            """, arguments: [batchId]).map { row in
                 var distractions: [Distraction]? = nil
                 var appSites: AppSites? = nil
                 if let metadataString: String = row["metadata"],
@@ -600,6 +1453,8 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                     }
                 }
                 return TimelineCard(
+                    recordId: row["id"],
+                    batchId: batchId,
                     startTimestamp: row["start"] ?? "",
                     endTimestamp: row["end"] ?? "",
                     category: row["category"],
@@ -616,7 +1471,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
             }
         }) ?? []
     }
-    
+
     // All batches, newest first
        func allBatches() -> [(id: Int64, start: Int, end: Int, status: String)] {
             (try? db.read { db in
@@ -627,6 +1482,28 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 }
             }) ?? []
         }
+
+    func fetchRecentAnalysisBatchesForDebug(limit: Int) -> [AnalysisBatchDebugEntry] {
+        guard limit > 0 else { return [] }
+
+        return (try? db.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT id, status, batch_start_ts, batch_end_ts, created_at, reason
+                FROM analysis_batches
+                ORDER BY id DESC
+                LIMIT ?
+            """, arguments: [limit]).map { row in
+                AnalysisBatchDebugEntry(
+                    id: row["id"],
+                    status: row["status"] ?? "unknown",
+                    startTs: row["batch_start_ts"] ?? 0,
+                    endTs: row["batch_end_ts"] ?? 0,
+                    createdAt: row["created_at"],
+                    reason: row["reason"]
+                )
+            }
+        }) ?? []
+    }
 
 
     func fetchTimelineCards(forDay day: String) -> [TimelineCard] {
@@ -655,11 +1532,12 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         
         let startTs = Int(dayStart.timeIntervalSince1970)
         let endTs = Int(dayEnd.timeIntervalSince1970)
-        
-        let cards: [TimelineCard]? = try? db.read { db in
+
+        let cards: [TimelineCard]? = try? timedRead("fetchTimelineCards(forDay:\(day))") { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM timeline_cards
                 WHERE start_ts >= ? AND start_ts < ?
+                  AND is_deleted = 0
                 ORDER BY start_ts ASC, start ASC
             """, arguments: [startTs, endTs])
             .map { row in
@@ -678,6 +1556,8 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
 
                 // Create TimelineCard instance using renamed columns
                 return TimelineCard(
+                    recordId: row["id"],
+                    batchId: row["batch_id"],
                     startTimestamp: row["start"] ?? "", // Use row["start"]
                     endTimestamp: row["end"] ?? "",   // Use row["end"]
                     category: row["category"],
@@ -695,18 +1575,20 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         }
         return cards ?? []
     }
-    
+
     func fetchTimelineCardsByTimeRange(from: Date, to: Date) -> [TimelineCard] {
         let decoder = JSONDecoder()
         let fromTs = Int(from.timeIntervalSince1970)
         let toTs = Int(to.timeIntervalSince1970)
-        
-        
-        let cards: [TimelineCard]? = try? db.read { db in
+
+
+        let cards: [TimelineCard]? = try? timedRead("fetchTimelineCardsByTimeRange") { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM timeline_cards
-                WHERE (start_ts < ? AND end_ts > ?)
-                   OR (start_ts >= ? AND start_ts < ?)
+                WHERE ((start_ts < ? AND end_ts > ?)
+                   OR (start_ts >= ? AND start_ts < ?))
+                  AND is_deleted = 0
+                  AND category != 'System'
                 ORDER BY start_ts ASC
             """, arguments: [toTs, fromTs, fromTs, toTs])
             .map { row in
@@ -725,6 +1607,8 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
 
                 // Create TimelineCard instance using renamed columns
                 return TimelineCard(
+                    recordId: row["id"],
+                    batchId: row["batch_id"],
                     startTimestamp: row["start"] ?? "",
                     endTimestamp: row["end"] ?? "",
                     category: row["category"],
@@ -743,14 +1627,153 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         let result = cards ?? []
         return result
     }
-    
+
+    /// Returns total minutes of tracked activities for the week containing the given date.
+    /// Week starts on Monday at 4 AM and ends the following Monday at 4 AM.
+    func fetchTotalMinutesTrackedForWeek(containing date: Date) -> Double {
+        let calendar = Calendar.current
+
+        // Find the Monday of the week containing this date
+        var weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date))!
+        // Set to 4 AM on that Monday
+        weekStart = calendar.date(bySettingHour: 4, minute: 0, second: 0, of: weekStart) ?? weekStart
+
+        // If current date is before 4 AM Monday, go back one week
+        if date < weekStart {
+            weekStart = calendar.date(byAdding: .weekOfYear, value: -1, to: weekStart) ?? weekStart
+        }
+
+        // Week ends at 4 AM the following Monday
+        let weekEnd = calendar.date(byAdding: .weekOfYear, value: 1, to: weekStart) ?? weekStart
+
+        let startTs = Int(weekStart.timeIntervalSince1970)
+        let endTs = Int(weekEnd.timeIntervalSince1970)
+
+        // Query sum of (end_ts - start_ts) for all non-deleted cards in the week
+        let totalSeconds: Double? = try? timedRead("fetchTotalMinutesTrackedForWeek") { db in
+            try Double.fetchOne(db, sql: """
+                SELECT COALESCE(SUM(end_ts - start_ts), 0)
+                FROM timeline_cards
+                WHERE start_ts >= ? AND start_ts < ?
+                AND is_deleted = 0
+                AND category != 'System'
+            """, arguments: [startTs, endTs])
+        }
+
+        return (totalSeconds ?? 0) / 60.0
+    }
+
+    func fetchRecentTimelineCardsForDebug(limit: Int) -> [TimelineCardDebugEntry] {
+        guard limit > 0 else { return [] }
+
+        return (try? db.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT batch_id, day, start, end, category, subcategory, title, summary, detailed_summary, created_at
+                FROM timeline_cards
+                WHERE is_deleted = 0
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, arguments: [limit]).map { row in
+                TimelineCardDebugEntry(
+                    createdAt: row["created_at"],
+                    batchId: row["batch_id"],
+                    day: row["day"] ?? "",
+                    startTime: row["start"] ?? "",
+                    endTime: row["end"] ?? "",
+                    category: row["category"],
+                    subcategory: row["subcategory"],
+                    title: row["title"],
+                    summary: row["summary"],
+                    detailedSummary: row["detailed_summary"]
+                )
+            }
+        }) ?? []
+    }
+
+    func fetchRecentLLMCallsForDebug(limit: Int) -> [LLMCallDebugEntry] {
+        guard limit > 0 else { return [] }
+
+        return (try? db.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT created_at, batch_id, call_group_id, attempt, provider, model, operation, status, latency_ms, http_status, request_method, request_url, request_body, response_body, error_message
+                FROM llm_calls
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, arguments: [limit]).map { row in
+                LLMCallDebugEntry(
+                    createdAt: row["created_at"],
+                    batchId: row["batch_id"],
+                    callGroupId: row["call_group_id"],
+                    attempt: row["attempt"] ?? 0,
+                    provider: row["provider"] ?? "",
+                    model: row["model"],
+                    operation: row["operation"] ?? "",
+                    status: row["status"] ?? "",
+                    latencyMs: row["latency_ms"],
+                    httpStatus: row["http_status"],
+                    requestMethod: row["request_method"],
+                    requestURL: row["request_url"],
+                    requestBody: row["request_body"],
+                    responseBody: row["response_body"],
+                    errorMessage: row["error_message"]
+                )
+            }
+        }) ?? []
+    }
+
+    func updateStorageLimit(bytes: Int64) {
+        let previous = StoragePreferences.recordingsLimitBytes
+        StoragePreferences.recordingsLimitBytes = bytes
+
+        if bytes < previous {
+            purgeIfNeeded()
+        }
+    }
+
+    func fetchLLMCallsForBatches(batchIds: [Int64], limit: Int) -> [LLMCallDebugEntry] {
+        guard !batchIds.isEmpty, limit > 0 else { return [] }
+
+        // Create SQL placeholders for batch IDs
+        let placeholders = Array(repeating: "?", count: batchIds.count).joined(separator: ",")
+
+        return (try? db.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT created_at, batch_id, call_group_id, attempt, provider, model, operation, status, latency_ms, http_status, request_method, request_url, request_body, response_body, error_message
+                FROM llm_calls
+                WHERE batch_id IN (\(placeholders))
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, arguments: StatementArguments(batchIds + [Int64(limit)])).map { row in
+                LLMCallDebugEntry(
+                    createdAt: row["created_at"],
+                    batchId: row["batch_id"],
+                    callGroupId: row["call_group_id"],
+                    attempt: row["attempt"] ?? 0,
+                    provider: row["provider"] ?? "",
+                    model: row["model"],
+                    operation: row["operation"] ?? "",
+                    status: row["status"] ?? "",
+                    latencyMs: row["latency_ms"],
+                    httpStatus: row["http_status"],
+                    requestMethod: row["request_method"],
+                    requestURL: row["request_url"],
+                    requestBody: row["request_body"],
+                    responseBody: row["response_body"],
+                    errorMessage: row["error_message"]
+                )
+            }
+        }) ?? []
+    }
+
     /// Fetch a specific timeline card by ID including timestamp fields
     func fetchTimelineCard(byId id: Int64) -> TimelineCardWithTimestamps? {
         let decoder = JSONDecoder()
-        
-        return try? db.read { db in
+
+        return try? timedRead("fetchTimelineCard(byId)") { db in
             guard let row = try Row.fetchOne(db, sql: """
-                SELECT * FROM timeline_cards WHERE id = ?
+                SELECT * FROM timeline_cards
+                WHERE id = ?
+                  AND is_deleted = 0
             """, arguments: [id]) else { return nil }
             
             // Decode distractions from metadata JSON
@@ -795,44 +1818,51 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         let timeFormatter = DateFormatter()
         timeFormatter.dateFormat = "h:mm a"
         timeFormatter.locale = Locale(identifier: "en_US_POSIX")
-        
-        try? db.write { db in
-            // First, fetch the video paths that will be deleted
+
+        try? timedWrite("replaceTimelineCardsInRange(\(newCards.count)_cards)") { db in
+            // First, fetch the video paths that will be soft-deleted
+            // Note: We exclude error cards (category='System') from other batches to preserve them
             let videoRows = try Row.fetchAll(db, sql: """
                 SELECT video_summary_url FROM timeline_cards
                 WHERE ((start_ts < ? AND end_ts > ?)
                    OR (start_ts >= ? AND start_ts < ?))
                    AND video_summary_url IS NOT NULL
-            """, arguments: [toTs, fromTs, fromTs, toTs])
-            
+                   AND is_deleted = 0
+                   AND (category != 'System' OR batch_id = ?)
+            """, arguments: [toTs, fromTs, fromTs, toTs, batchId])
+
             videoPaths = videoRows.compactMap { $0["video_summary_url"] as? String }
-            
+
             // Fetch the cards that will be deleted for debugging
             let cardsToDelete = try Row.fetchAll(db, sql: """
                 SELECT id, start, end, title FROM timeline_cards
-                WHERE (start_ts < ? AND end_ts > ?)
-                   OR (start_ts >= ? AND start_ts < ?)
-            """, arguments: [toTs, fromTs, fromTs, toTs])
-            
-            for card in cardsToDelete {
-                let id: Int64 = card["id"]
-                let start: String = card["start"]
-                let end: String = card["end"]
-                let title: String = card["title"]
+                WHERE ((start_ts < ? AND end_ts > ?)
+                   OR (start_ts >= ? AND start_ts < ?))
+                   AND is_deleted = 0
+                   AND (category != 'System' OR batch_id = ?)
+            """, arguments: [toTs, fromTs, fromTs, toTs, batchId])
+
+            for _ in cardsToDelete {
+                // Cards being deleted - no-op needed, just iterating to trigger side effects
             }
-            
-            // Delete existing cards in the range using timestamp columns
+
+            // Soft delete existing cards in the range using timestamp columns
+            // Preserve error cards (category='System') from other batches so they remain visible
             try db.execute(sql: """
-                DELETE FROM timeline_cards
-                WHERE (start_ts < ? AND end_ts > ?)
-                   OR (start_ts >= ? AND start_ts < ?)
-            """, arguments: [toTs, fromTs, fromTs, toTs])
-            
-            // Verify deletion
+                UPDATE timeline_cards
+                SET is_deleted = 1
+                WHERE ((start_ts < ? AND end_ts > ?)
+                   OR (start_ts >= ? AND start_ts < ?))
+                   AND is_deleted = 0
+                   AND (category != 'System' OR batch_id = ?)
+            """, arguments: [toTs, fromTs, fromTs, toTs, batchId])
+
+            // Verify soft deletion (count remaining active cards)
             let remainingCount = try Int.fetchOne(db, sql: """
                 SELECT COUNT(*) FROM timeline_cards
-                WHERE (start_ts < ? AND end_ts > ?)
-                   OR (start_ts >= ? AND start_ts < ?)
+                WHERE ((start_ts < ? AND end_ts > ?)
+                   OR (start_ts >= ? AND start_ts < ?))
+                   AND is_deleted = 0
             """, arguments: [toTs, fromTs, fromTs, toTs]) ?? 0
             
             if remainingCount > 0 {
@@ -844,50 +1874,51 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 // Encode metadata object with distractions and appSites
                 let meta = TimelineMetadata(distractions: card.distractions, appSites: card.appSites)
                 let metadataString: String? = (try? encoder.encode(meta)).flatMap { String(data: $0, encoding: .utf8) }
-                
-                // Since we don't have the day anymore, we need to infer it from the time range
-                // Use the 'from' date as the base date for parsing
+
+                // Resolve clock-only timestamps by picking the nearest day to the window midpoint
                 let calendar = Calendar.current
-                var baseDate = from
-                
-                // Adjust to the logical day (considering 4 AM boundary)
-                let hour = calendar.component(.hour, from: baseDate)
-                if hour < 4 {
-                    baseDate = calendar.date(byAdding: .day, value: -1, to: baseDate) ?? baseDate
+                let anchor = from.addingTimeInterval(to.timeIntervalSince(from) / 2.0)
+
+                let resolveClock: (Int, Int) -> Date = { hour, minute in
+                    guard let sameDay = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: anchor) else {
+                        return anchor
+                    }
+                    let previousDay = calendar.date(byAdding: .day, value: -1, to: sameDay) ?? sameDay
+                    let nextDay = calendar.date(byAdding: .day, value: 1, to: sameDay) ?? sameDay
+
+                    let candidates = [previousDay, sameDay, nextDay]
+                    return candidates.min { lhs, rhs in
+                        abs(lhs.timeIntervalSince(anchor)) < abs(rhs.timeIntervalSince(anchor))
+                    } ?? sameDay
                 }
-                
+
                 guard let startTime = timeFormatter.date(from: card.startTimestamp),
                       let endTime = timeFormatter.date(from: card.endTimestamp) else {
                     continue
                 }
-                
+
                 let startComponents = calendar.dateComponents([.hour, .minute], from: startTime)
                 guard let startHour = startComponents.hour, let startMinute = startComponents.minute else { continue }
-                
-                var startDate = calendar.date(bySettingHour: startHour, minute: startMinute, second: 0, of: baseDate) ?? baseDate
-                
-                // Handle day boundary for times after midnight
-                if startHour < 4 {
-                    startDate = calendar.date(byAdding: .day, value: 1, to: startDate) ?? startDate
-                }
-                
+
+                let startDate = resolveClock(startHour, startMinute)
+
                 let startTs = Int(startDate.timeIntervalSince1970)
-                
+
                 let endComponents = calendar.dateComponents([.hour, .minute], from: endTime)
                 guard let endHour = endComponents.hour, let endMinute = endComponents.minute else { continue }
-                
-                var endDate = calendar.date(bySettingHour: endHour, minute: endMinute, second: 0, of: baseDate) ?? baseDate
-                
-                // Handle day boundary
-                if endHour < 4 || endDate < startDate {
+
+                var endDate = resolveClock(endHour, endMinute)
+
+                // Handle midnight crossing: if end time is before start time, it must be the next day
+                if endDate < startDate {
                     endDate = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
                 }
-                
+
                 let endTs = Int(endDate.timeIntervalSince1970)
-                
-                // Calculate the day string from the start timestamp for backward compatibility
-                let dayString = self.dateFormatter.string(from: startDate)
-                
+
+                // Calculate the day string using 4 AM boundary rules
+                let (dayString, _, _) = startDate.getDayInfoFor4AMBoundary()
+
                 try db.execute(sql: """
                     INSERT INTO timeline_cards(
                         batch_id, start, end, start_ts, end_ts, day, title,
@@ -913,7 +1944,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     
     func saveObservations(batchId: Int64, observations: [Observation]) {
         guard !observations.isEmpty else { return }
-        try? db.write { db in
+        try? timedWrite("saveObservations(\(observations.count)_items)") { db in
             for obs in observations {
                 try db.execute(sql: """
                     INSERT INTO observations(
@@ -929,7 +1960,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     }
     
     func fetchObservations(batchId: Int64) -> [Observation] {
-        (try? db.read { db in
+        (try? timedRead("fetchObservations(batchId)") { db in
             try Row.fetchAll(db, sql: """
                 SELECT * FROM observations 
                 WHERE batch_id = ? 
@@ -982,9 +2013,10 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
                 FROM chunks c
                 JOIN batch_chunks bc ON c.id = bc.chunk_id
                 WHERE bc.batch_id = ?
+                  AND (c.is_deleted = 0 OR c.is_deleted IS NULL)
                 ORDER BY c.start_ts
             """
-            
+
             let rows = try Row.fetchAll(db, sql: sql, arguments: [batchId])
             return rows.compactMap { $0["file_url"] as? String }
         }) ?? []
@@ -1076,7 +2108,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         guard !paths.isEmpty else { return [:] }
         var out: [String: (Int, Int)] = [:]
         let placeholders = Array(repeating: "?", count: paths.count).joined(separator: ",")
-        let sql = "SELECT file_url, start_ts, end_ts FROM chunks WHERE file_url IN (\(placeholders))"
+        let sql = "SELECT file_url, start_ts, end_ts FROM chunks WHERE file_url IN (\(placeholders)) AND (is_deleted = 0 OR is_deleted IS NULL)"
         try? db.read { db in
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(paths))
             for row in rows {
@@ -1117,25 +2149,70 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         
         let startTs = Int(dayStart.timeIntervalSince1970)
         let endTs = Int(dayEnd.timeIntervalSince1970)
-        
-        try? db.write { db in
-            // First fetch all video paths before deletion
+
+        try? timedWrite("deleteTimelineCards(forDay:\(day))") { db in
+            // First fetch all video paths before soft deletion
             let rows = try Row.fetchAll(db, sql: """
                 SELECT video_summary_url FROM timeline_cards
-                WHERE start_ts >= ? AND start_ts < ? AND video_summary_url IS NOT NULL
+                WHERE start_ts >= ? AND start_ts < ?
+                  AND video_summary_url IS NOT NULL
+                  AND is_deleted = 0
             """, arguments: [startTs, endTs])
-            
+
             videoPaths = rows.compactMap { $0["video_summary_url"] as? String }
-            
-            // Delete the timeline cards
+
+            // Soft delete the timeline cards by setting is_deleted = 1
             try db.execute(sql: """
-                DELETE FROM timeline_cards WHERE start_ts >= ? AND start_ts < ?
+                UPDATE timeline_cards
+                SET is_deleted = 1
+                WHERE start_ts >= ? AND start_ts < ?
+                  AND is_deleted = 0
             """, arguments: [startTs, endTs])
         }
         
         return videoPaths
     }
-    
+
+    func deleteTimelineCards(forBatchIds batchIds: [Int64]) -> [String] {
+        guard !batchIds.isEmpty else { return [] }
+        var videoPaths: [String] = []
+        let placeholders = Array(repeating: "?", count: batchIds.count).joined(separator: ",")
+
+        do {
+            try timedWrite("deleteTimelineCards(forBatchIds:\(batchIds.count))") { db in
+                // Fetch video paths for active records only
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT video_summary_url
+                        FROM timeline_cards
+                        WHERE batch_id IN (\(placeholders))
+                          AND video_summary_url IS NOT NULL
+                          AND is_deleted = 0
+                    """,
+                    arguments: StatementArguments(batchIds)
+                )
+
+                videoPaths = rows.compactMap { $0["video_summary_url"] as? String }
+
+                // Soft delete the records
+                try db.execute(
+                    sql: """
+                        UPDATE timeline_cards
+                        SET is_deleted = 1
+                        WHERE batch_id IN (\(placeholders))
+                          AND is_deleted = 0
+                    """,
+                    arguments: StatementArguments(batchIds)
+                )
+            }
+        } catch {
+            print("deleteTimelineCards(forBatchIds:) failed: \(error)")
+        }
+
+        return videoPaths
+    }
+
     func deleteObservations(forBatchIds batchIds: [Int64]) {
         guard !batchIds.isEmpty else { return }
         
@@ -1185,6 +2262,42 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         
         return affectedBatchIds
     }
+
+    func resetBatchStatuses(forBatchIds batchIds: [Int64]) -> [Int64] {
+        guard !batchIds.isEmpty else { return [] }
+        var affectedBatchIds: [Int64] = []
+        let placeholders = Array(repeating: "?", count: batchIds.count).joined(separator: ",")
+
+        do {
+            try timedWrite("resetBatchStatuses(forBatchIds:\(batchIds.count))") { db in
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT id FROM analysis_batches
+                        WHERE id IN (\(placeholders))
+                    """,
+                    arguments: StatementArguments(batchIds)
+                )
+
+                affectedBatchIds = rows.compactMap { $0["id"] as? Int64 }
+                guard !affectedBatchIds.isEmpty else { return }
+
+                let affectedPlaceholders = Array(repeating: "?", count: affectedBatchIds.count).joined(separator: ",")
+                try db.execute(
+                    sql: """
+                        UPDATE analysis_batches
+                        SET status = 'pending', reason = NULL, llm_metadata = NULL
+                        WHERE id IN (\(affectedPlaceholders))
+                    """,
+                    arguments: StatementArguments(affectedBatchIds)
+                )
+            }
+        } catch {
+            print("resetBatchStatuses(forBatchIds:) failed: \(error)")
+        }
+
+        return affectedBatchIds
+    }
     
     func fetchBatches(forDay day: String) -> [(id: Int64, startTs: Int, endTs: Int, status: String)] {
         // Calculate day boundaries (4 AM to 4 AM)
@@ -1217,7 +2330,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
     
     func resetSpecificBatchStatuses(batchIds: [Int64]) {
         guard !batchIds.isEmpty else { return }
-        
+
         try? db.write { db in
             let placeholders = Array(repeating: "?", count: batchIds.count).joined(separator: ",")
             try db.execute(sql: """
@@ -1228,84 +2341,765 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         }
     }
 
+    // MARK: - Journal Entry Methods
+
+    /// Fetch journal entry for a specific day (using 4AM boundary format)
+    func fetchJournalEntry(forDay day: String) -> JournalEntry? {
+        return try? timedRead("fetchJournalEntry(forDay:\(day))") { db in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT * FROM journal_entries WHERE day = ?
+            """, arguments: [day]) else { return nil }
+
+            return JournalEntry(
+                id: row["id"],
+                day: row["day"],
+                intentions: row["intentions"],
+                notes: row["notes"],
+                goals: row["goals"],
+                reflections: row["reflections"],
+                summary: row["summary"],
+                status: row["status"] ?? "draft",
+                createdAt: row["created_at"],
+                updatedAt: row["updated_at"]
+            )
+        }
+    }
+
+    /// Save or update a journal entry (upsert)
+    func saveJournalEntry(_ entry: JournalEntry) {
+        try? timedWrite("saveJournalEntry") { db in
+            try db.execute(sql: """
+                INSERT INTO journal_entries (day, intentions, notes, goals, reflections, summary, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(day) DO UPDATE SET
+                    intentions = excluded.intentions,
+                    notes = excluded.notes,
+                    goals = excluded.goals,
+                    reflections = excluded.reflections,
+                    summary = excluded.summary,
+                    status = excluded.status,
+                    updated_at = CURRENT_TIMESTAMP
+            """, arguments: [
+                entry.day,
+                entry.intentions,
+                entry.notes,
+                entry.goals,
+                entry.reflections,
+                entry.summary,
+                entry.status
+            ])
+        }
+    }
+
+    /// Update just the intentions/notes/goals fields (morning form)
+    func updateJournalIntentions(day: String, intentions: String?, notes: String?, goals: String?) {
+        try? timedWrite("updateJournalIntentions") { db in
+            // Check if entry exists
+            let exists = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM journal_entries WHERE day = ?", arguments: [day]) ?? 0
+
+            if exists > 0 {
+                try db.execute(sql: """
+                    UPDATE journal_entries
+                    SET intentions = ?, notes = ?, goals = ?, status = 'intentions_set', updated_at = CURRENT_TIMESTAMP
+                    WHERE day = ?
+                """, arguments: [intentions, notes, goals, day])
+            } else {
+                try db.execute(sql: """
+                    INSERT INTO journal_entries (day, intentions, notes, goals, status)
+                    VALUES (?, ?, ?, ?, 'intentions_set')
+                """, arguments: [day, intentions, notes, goals])
+            }
+        }
+    }
+
+    /// Update just the reflections field (evening reflection)
+    func updateJournalReflections(day: String, reflections: String?) {
+        try? timedWrite("updateJournalReflections") { db in
+            let exists = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM journal_entries WHERE day = ?", arguments: [day]) ?? 0
+
+            if exists > 0 {
+                try db.execute(sql: """
+                    UPDATE journal_entries
+                    SET reflections = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE day = ?
+                """, arguments: [reflections, day])
+            } else {
+                try db.execute(sql: """
+                    INSERT INTO journal_entries (day, reflections, status)
+                    VALUES (?, ?, 'draft')
+                """, arguments: [day, reflections])
+            }
+        }
+    }
+
+    /// Update just the AI summary field
+    func updateJournalSummary(day: String, summary: String?) {
+        try? timedWrite("updateJournalSummary") { db in
+            let exists = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM journal_entries WHERE day = ?", arguments: [day]) ?? 0
+
+            if exists > 0 {
+                try db.execute(sql: """
+                    UPDATE journal_entries
+                    SET summary = ?, status = 'complete', updated_at = CURRENT_TIMESTAMP
+                    WHERE day = ?
+                """, arguments: [summary, day])
+            } else {
+                try db.execute(sql: """
+                    INSERT INTO journal_entries (day, summary, status)
+                    VALUES (?, ?, 'complete')
+                """, arguments: [day, summary])
+            }
+        }
+    }
+
+    /// Fetch the most recent journal summary within the last N days
+    /// Returns the day string and summary text, or nil if none found
+    func fetchRecentJournalSummary(withinDays days: Int) -> (day: String, summary: String)? {
+        let calendar = Calendar.current
+        let today = Date()
+        guard let cutoffDate = calendar.date(byAdding: .day, value: -days, to: today) else { return nil }
+        let cutoffDay = DateFormatter.yyyyMMdd.string(from: cutoffDate)
+
+        return try? timedRead("fetchRecentJournalSummary") { db in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT day, summary FROM journal_entries
+                WHERE summary IS NOT NULL AND summary != ''
+                  AND day >= ?
+                ORDER BY day DESC
+                LIMIT 1
+            """, arguments: [cutoffDay]) else { return nil }
+
+            guard let day: String = row["day"],
+                  let summary: String = row["summary"] else { return nil }
+
+            return (day, summary)
+        }
+    }
+
+    /// Fetch the most recent N journal summaries, optionally excluding a specific day
+    /// Returns array of (day, summary) tuples ordered by most recent first
+    func fetchRecentJournalSummaries(count: Int, excludingDay: String? = nil) -> [(day: String, summary: String)] {
+        return (try? timedRead("fetchRecentJournalSummaries") { db in
+            var sql = """
+                SELECT day, summary FROM journal_entries
+                WHERE summary IS NOT NULL AND summary != ''
+            """
+            var arguments: [String] = []
+
+            if let excludeDay = excludingDay {
+                sql += " AND day != ?"
+                arguments.append(excludeDay)
+            }
+
+            sql += " ORDER BY day DESC LIMIT ?"
+            arguments.append(String(count))
+
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+
+            return rows.compactMap { row -> (day: String, summary: String)? in
+                guard let day: String = row["day"],
+                      let summary: String = row["summary"] else { return nil }
+                return (day, summary)
+            }
+        }) ?? []
+    }
+
+    /// Check if a day has intentions set (not just draft)
+    func hasIntentionsForDay(_ day: String) -> Bool {
+        return (try? timedRead("hasIntentionsForDay") { db in
+            let count = try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM journal_entries
+                WHERE day = ? AND status IN ('intentions_set', 'complete')
+            """, arguments: [day]) ?? 0
+            return count > 0
+        }) ?? false
+    }
+
+    /// Fetch the most recent long-term goals from any previous journal entry
+    func fetchMostRecentGoals() -> String? {
+        return try? timedRead("fetchMostRecentGoals") { db in
+            let row = try Row.fetchOne(db, sql: """
+                SELECT goals FROM journal_entries
+                WHERE goals IS NOT NULL AND goals != ''
+                ORDER BY day DESC
+                LIMIT 1
+            """)
+            return row?["goals"]
+        }
+    }
+
+    /// Check if a day has at least 1 hour of timeline activity
+    func hasMinimumTimelineActivity(forDay day: String, minimumMinutes: Int = 60) -> Bool {
+        guard let dayDate = dateFormatter.date(from: day) else { return false }
+
+        let calendar = Calendar.current
+
+        // Get 4 AM boundaries
+        var startComponents = calendar.dateComponents([.year, .month, .day], from: dayDate)
+        startComponents.hour = 4
+        startComponents.minute = 0
+        startComponents.second = 0
+        guard let dayStart = calendar.date(from: startComponents) else { return false }
+
+        guard let nextDay = calendar.date(byAdding: .day, value: 1, to: dayDate) else { return false }
+        var endComponents = calendar.dateComponents([.year, .month, .day], from: nextDay)
+        endComponents.hour = 4
+        endComponents.minute = 0
+        endComponents.second = 0
+        guard let dayEnd = calendar.date(from: endComponents) else { return false }
+
+        let startTs = Int(dayStart.timeIntervalSince1970)
+        let endTs = Int(dayEnd.timeIntervalSince1970)
+
+        // Sum total duration of timeline cards for the day
+        let totalMinutes: Int? = try? timedRead("hasMinimumTimelineActivity") { db in
+            // Calculate sum of (end_ts - start_ts) for all cards, converted to minutes
+            let result = try Int.fetchOne(db, sql: """
+                SELECT COALESCE(SUM(end_ts - start_ts), 0) / 60 as total_minutes
+                FROM timeline_cards
+                WHERE start_ts >= ? AND start_ts < ?
+                  AND is_deleted = 0
+            """, arguments: [startTs, endTs])
+            return result
+        }
+
+        return (totalMinutes ?? 0) >= minimumMinutes
+    }
+
+    /// Fetch list of days that have journal entries (for navigation)
+    func fetchJournalDays(limit: Int = 30) -> [String] {
+        return (try? timedRead("fetchJournalDays") { db in
+            try String.fetchAll(db, sql: """
+                SELECT day FROM journal_entries
+                ORDER BY day DESC
+                LIMIT ?
+            """, arguments: [limit])
+        }) ?? []
+    }
+
 
     private let purgeQ = DispatchQueue(label: "com.dayflow.storage.purge", qos: .background)
+    private var purgeTimer: DispatchSourceTimer?
+    private var checkpointTimer: DispatchSourceTimer?
+
+    // MARK: - WAL Checkpoint
+
+    /// Checkpoint the WAL file to merge changes into the main database.
+    /// This prevents WAL from growing unbounded and reduces data loss risk on crash.
+    /// - Parameter mode: .passive (non-blocking), .full, .restart, or .truncate (resets WAL to zero)
+    func checkpoint(mode: Database.CheckpointMode = .passive) {
+        do {
+            _ = try db.writeWithoutTransaction { db in
+                try db.checkpoint(mode)
+            }
+            print("✅ [StorageManager] WAL checkpoint completed (mode: \(mode))")
+        } catch {
+            print("⚠️ [StorageManager] WAL checkpoint failed: \(error)")
+            // Log to Sentry for visibility
+            let breadcrumb = Breadcrumb(level: .warning, category: "database")
+            breadcrumb.message = "WAL checkpoint failed"
+            breadcrumb.data = ["mode": "\(mode)", "error": "\(error)"]
+            SentryHelper.addBreadcrumb(breadcrumb)
+        }
+    }
+
+    private func startCheckpointScheduler() {
+        let timer = DispatchSource.makeTimerSource(queue: dbWriteQueue)
+        timer.schedule(deadline: .now() + 300, repeating: 300) // Every 5 minutes
+        timer.setEventHandler { [weak self] in
+            self?.checkpoint(mode: .passive)
+        }
+        timer.resume()
+        checkpointTimer = timer
+    }
+
+    // MARK: - Safe Database Initialization
+
+    /// Opens the database with automatic recovery from backup if corrupted.
+    /// Order of attempts: 1) Normal open, 2) Restore from most recent backup, 3) Fresh database
+    private static func openDatabaseSafely(
+        at dbURL: URL,
+        backupsDir: URL,
+        config: Configuration,
+        fileManager: FileManager
+    ) -> DatabasePool {
+        // Attempt 1: Normal open
+        do {
+            let pool = try DatabasePool(path: dbURL.path, configuration: config)
+            print("✅ [StorageManager] Database opened successfully")
+            return pool
+        } catch {
+            print("⚠️ [StorageManager] Failed to open database: \(error)")
+
+            let breadcrumb = Breadcrumb(level: .error, category: "database")
+            breadcrumb.message = "Database open failed, attempting recovery"
+            breadcrumb.data = ["error": "\(error)"]
+            SentryHelper.addBreadcrumb(breadcrumb)
+
+            // Attempt 2: Restore from most recent backup
+            if let backupURL = findMostRecentBackup(in: backupsDir, fileManager: fileManager) {
+                print("🔄 [StorageManager] Attempting recovery from backup: \(backupURL.lastPathComponent)")
+
+                // Remove corrupted database files
+                let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+                let shmURL = URL(fileURLWithPath: dbURL.path + "-shm")
+                try? fileManager.removeItem(at: dbURL)
+                try? fileManager.removeItem(at: walURL)
+                try? fileManager.removeItem(at: shmURL)
+
+                // Copy backup to database location
+                do {
+                    try fileManager.copyItem(at: backupURL, to: dbURL)
+                    let pool = try DatabasePool(path: dbURL.path, configuration: config)
+                    print("✅ [StorageManager] Successfully recovered from backup")
+
+                    let recoveryBreadcrumb = Breadcrumb(level: .info, category: "database")
+                    recoveryBreadcrumb.message = "Database recovered from backup"
+                    recoveryBreadcrumb.data = ["backup": backupURL.lastPathComponent]
+                    SentryHelper.addBreadcrumb(recoveryBreadcrumb)
+
+                    return pool
+                } catch {
+                    print("❌ [StorageManager] Backup recovery failed: \(error)")
+                }
+            }
+
+            // Attempt 3: Start fresh (last resort)
+            print("🆕 [StorageManager] Starting with fresh database")
+            let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
+            let shmURL = URL(fileURLWithPath: dbURL.path + "-shm")
+            try? fileManager.removeItem(at: dbURL)
+            try? fileManager.removeItem(at: walURL)
+            try? fileManager.removeItem(at: shmURL)
+
+            do {
+                let pool = try DatabasePool(path: dbURL.path, configuration: config)
+
+                let freshBreadcrumb = Breadcrumb(level: .warning, category: "database")
+                freshBreadcrumb.message = "Started with fresh database after all recovery attempts failed"
+                SentryHelper.addBreadcrumb(freshBreadcrumb)
+
+                return pool
+            } catch {
+                // This is truly fatal - can't even create a fresh database
+                fatalError("[StorageManager] Cannot create database: \(error)")
+            }
+        }
+    }
+
+    /// Finds the most recent backup file in the backups directory
+    private static func findMostRecentBackup(in backupsDir: URL, fileManager: FileManager) -> URL? {
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: backupsDir,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: .skipsHiddenFiles
+        ) else {
+            return nil
+        }
+
+        let sqliteBackups = contents.filter { $0.pathExtension == "sqlite" }
+
+        // Sort by creation date, newest first
+        let sorted = sqliteBackups.sorted { url1, url2 in
+            let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return date1 > date2
+        }
+
+        return sorted.first
+    }
+
+    // MARK: - Integrity Check
+
+    /// Performs a quick integrity check on the database.
+    /// Logs a warning if issues are found but doesn't stop app launch.
+    private func performIntegrityCheck() {
+        do {
+            let result = try db.read { db -> String? in
+                try String.fetchOne(db, sql: "PRAGMA quick_check")
+            }
+
+            if result == "ok" {
+                print("✅ [StorageManager] Database integrity check passed")
+            } else {
+                print("⚠️ [StorageManager] Database integrity issues: \(result ?? "unknown")")
+
+                let breadcrumb = Breadcrumb(level: .warning, category: "database")
+                breadcrumb.message = "Database integrity check found issues"
+                breadcrumb.data = ["result": result ?? "unknown"]
+                SentryHelper.addBreadcrumb(breadcrumb)
+            }
+        } catch {
+            print("⚠️ [StorageManager] Integrity check failed: \(error)")
+
+            let breadcrumb = Breadcrumb(level: .error, category: "database")
+            breadcrumb.message = "Database integrity check error"
+            breadcrumb.data = ["error": "\(error)"]
+            SentryHelper.addBreadcrumb(breadcrumb)
+        }
+    }
+
+    // MARK: - Backup System
+
+    private var backupTimer: DispatchSourceTimer?
+
+    /// Creates a backup of the database using GRDB's native backup API.
+    /// Backups are stored with timestamp in filename and old backups are pruned.
+    func createBackup() {
+        dbWriteQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+            let timestamp = formatter.string(from: Date())
+            let backupName = "chunks-\(timestamp).sqlite"
+            let backupURL = self.backupsDir.appendingPathComponent(backupName)
+
+            do {
+                // Create destination database for backup
+                let destination = try DatabaseQueue(path: backupURL.path)
+
+                // Use GRDB's native backup API
+                try self.db.backup(to: destination)
+
+                print("✅ [StorageManager] Backup created: \(backupName)")
+
+                let breadcrumb = Breadcrumb(level: .info, category: "database")
+                breadcrumb.message = "Database backup created"
+                breadcrumb.data = ["filename": backupName]
+                SentryHelper.addBreadcrumb(breadcrumb)
+
+                // Prune old backups, keeping last 3
+                self.pruneOldBackups(keeping: 3)
+
+            } catch {
+                print("❌ [StorageManager] Backup failed: \(error)")
+
+                let breadcrumb = Breadcrumb(level: .error, category: "database")
+                breadcrumb.message = "Database backup failed"
+                breadcrumb.data = ["error": "\(error)"]
+                SentryHelper.addBreadcrumb(breadcrumb)
+            }
+        }
+    }
+
+    /// Removes old backups, keeping only the most recent `count` backups.
+    private func pruneOldBackups(keeping count: Int) {
+        guard let contents = try? fileMgr.contentsOfDirectory(
+            at: backupsDir,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: .skipsHiddenFiles
+        ) else {
+            return
+        }
+
+        let sqliteBackups = contents.filter { $0.pathExtension == "sqlite" }
+
+        // Sort by creation date, newest first
+        let sorted = sqliteBackups.sorted { url1, url2 in
+            let date1 = (try? url1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            let date2 = (try? url2.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+            return date1 > date2
+        }
+
+        // Remove all but the newest `count` backups
+        if sorted.count > count {
+            let toDelete = sorted.dropFirst(count)
+            for url in toDelete {
+                try? fileMgr.removeItem(at: url)
+                print("🗑️ [StorageManager] Pruned old backup: \(url.lastPathComponent)")
+            }
+        }
+    }
+
+    /// Schedules daily backups (every 24 hours, starting 1 hour after launch)
+    private func startBackupScheduler() {
+        let timer = DispatchSource.makeTimerSource(queue: dbWriteQueue)
+        // First backup 1 hour after launch, then every 24 hours
+        timer.schedule(deadline: .now() + 3600, repeating: 86400)
+        timer.setEventHandler { [weak self] in
+            self?.createBackup()
+        }
+        timer.resume()
+        backupTimer = timer
+
+        // Also create an immediate backup on first launch if none exists
+        if Self.findMostRecentBackup(in: backupsDir, fileManager: fileMgr) == nil {
+            createBackup()
+        }
+    }
+
+    private func startPurgeScheduler() {
+        let timer = DispatchSource.makeTimerSource(queue: purgeQ)
+        timer.schedule(deadline: .now() + 3600, repeating: 3600) // Every hour
+        timer.setEventHandler { [weak self] in
+            self?.purgeIfNeeded()
+            TimelapseStorageManager.shared.purgeIfNeeded()
+        }
+        timer.resume()
+        purgeTimer = timer
+    }
 
     private func purgeIfNeeded() {
         purgeQ.async { [weak self] in
             guard let self = self else { return }
-            
-            do {
-                // Check current size
-                let currentSize = try self.fileMgr.allocatedSizeOfDirectory(at: self.root)
-                
-                // 3 days cutoff for all chunks
-                let cutoffDate = Date().addingTimeInterval(-3 * 24 * 60 * 60)
-                let cutoffTimestamp = Int(cutoffDate.timeIntervalSince1970)
-                
-                // Clean up if over 20GB
-                if currentSize > 10_000_000_000 {
-                    
-                    try self.db.write { db in
-                        // Get chunks older than 3 days with file paths still set
-                        let oldChunks = try Row.fetchAll(db, sql: """
-                            SELECT id, file_url, start_ts 
-                            FROM chunks 
-                            WHERE start_ts < ?
-                            AND file_url IS NOT NULL
-                            AND file_url != ''
-                            AND (is_deleted = 0 OR is_deleted IS NULL)
-                            ORDER BY start_ts ASC 
+            self.performPurgeIfNeeded()
+        }
+    }
+
+    func purgeNow(completion: (() -> Void)? = nil) {
+        purgeQ.async { [weak self] in
+            guard let self = self else {
+                if let completion {
+                    DispatchQueue.main.async { completion() }
+                }
+                return
+            }
+            self.performPurgeIfNeeded()
+            if let completion {
+                DispatchQueue.main.async { completion() }
+            }
+        }
+    }
+
+    private func performPurgeIfNeeded() {
+        do {
+            let limit = StoragePreferences.recordingsLimitBytes
+
+            if limit == Int64.max {
+                return // Unlimited storage - skip purge
+            }
+
+            cleanupRecordingStragglers()
+
+            // Check current size after cleaning orphans
+            let currentSize = try fileMgr.allocatedSizeOfDirectory(at: root)
+
+            // Clean up if above limit
+            if currentSize > limit {
+                var freedSpace: Int64 = 0
+                var passCount = 0
+
+                while currentSize - freedSpace > limit {
+                    var deletedThisPass = 0
+                    var freedThisPass: Int64 = 0
+
+                    try timedWrite("purgeScreenshots") { db in
+                        // Get oldest active screenshots
+                        let oldScreenshots = try Row.fetchAll(db, sql: """
+                            SELECT id, file_path, file_size
+                            FROM screenshots
+                            WHERE is_deleted = 0
+                            ORDER BY captured_at ASC
                             LIMIT 500
-                        """, arguments: [cutoffTimestamp])
-                        
-                        var deletedCount = 0
-                        var freedSpace: Int = 0
-                        
-                        for chunk in oldChunks {
-                            guard let id: Int64 = chunk["id"], 
-                                  let path: String = chunk["file_url"] else { continue }
-                            
-                            // Delete physical file
-                            if FileManager.default.fileExists(atPath: path) {
-                                if let attrs = try? self.fileMgr.attributesOfItem(atPath: path),
-                                   let fileSize = attrs[.size] as? NSNumber {
-                                    freedSpace += fileSize.intValue
-                                }
-                                try? self.fileMgr.removeItem(atPath: path)
-                            }
-                            
-                            // Mark as deleted
+                        """)
+
+                        guard !oldScreenshots.isEmpty else { return }
+
+                        for screenshot in oldScreenshots {
+                            guard let id: Int64 = screenshot["id"],
+                                  let path: String = screenshot["file_path"] else { continue }
+
+                            // Mark as deleted in DB first (safer ordering)
                             try db.execute(sql: """
-                                UPDATE chunks 
-                                SET is_deleted = 1 
+                                UPDATE screenshots
+                                SET is_deleted = 1
                                 WHERE id = ?
                             """, arguments: [id])
-                            
-                            deletedCount += 1
-                            
-                            // Stop if we've freed enough space (under 10GB)
-                            if currentSize - freedSpace < 10_000_000_000 {
-                                break
+
+                            // Then delete physical file
+                            if fileMgr.fileExists(atPath: path) {
+                                var fileSize: Int64 = 0
+                                if let storedSize: Int64 = screenshot["file_size"] {
+                                    fileSize = storedSize
+                                }
+                                if fileSize == 0,
+                                   let attrs = try? fileMgr.attributesOfItem(atPath: path),
+                                   let size = attrs[.size] as? NSNumber {
+                                    fileSize = size.int64Value
+                                }
+
+                                do {
+                                    try fileMgr.removeItem(atPath: path)
+                                    freedThisPass += fileSize
+                                    deletedThisPass += 1
+                                } catch {
+                                    print("⚠️ Failed to delete screenshot at \(path): \(error)")
+                                }
+                            } else {
+                                deletedThisPass += 1
                             }
                         }
-                        
-                        // freedGB retained for future use if needed
+                    }
+
+                    if deletedThisPass == 0 {
+                        break
+                    }
+
+                    freedSpace += freedThisPass
+                    passCount += 1
+
+                    if passCount > 200 {
+                        break
                     }
                 }
+            }
+
+            cleanupRecordingStragglers()
+        } catch {
+            print("❌ Purge error: \(error)")
+        }
+    }
+
+    private func cleanupRecordingStragglers() {
+        // Delete any recordings that are not referenced by active screenshots.
+        let activeScreenshotPaths: Set<String> = Set((try? timedRead("activeScreenshotPaths") { db in
+            try Row.fetchAll(db, sql: """
+                SELECT file_path
+                FROM screenshots
+                WHERE is_deleted = 0
+            """)
+            .compactMap { $0["file_path"] as? String }
+        }) ?? [])
+
+        guard let enumerator = fileMgr.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let deleteAll = activeScreenshotPaths.isEmpty
+
+        for case let fileURL as URL in enumerator {
+            do {
+                let values = try fileURL.resourceValues(forKeys: [.isDirectoryKey])
+                if values.isDirectory == true { continue }
+
+                if deleteAll || !activeScreenshotPaths.contains(fileURL.path) {
+                    try fileMgr.removeItem(at: fileURL)
+                }
             } catch {
-                print("❌ Purge error: \(error)")
+                print("⚠️ Failed to delete straggler file at \(fileURL.path): \(error)")
             }
         }
     }
 }
 
 
-private extension FileManager {
-    func allocatedSizeOfDirectory(at url: URL) throws -> Int {
-        try contentsOfDirectory(at: url, includingPropertiesForKeys: [.totalFileAllocatedSizeKey])
-            .reduce(0) { sum, file in
-                sum + (try file.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize ?? 0)
+private extension StorageManager {
+    func migrateLegacyChunkPathsIfNeeded() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        guard let appSupport = fileMgr.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+
+        let legacyBase = fileMgr.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers/\(bundleID)/Data/Library/Application Support/Dayflow", isDirectory: true)
+        let newBase = appSupport.appendingPathComponent("Dayflow", isDirectory: true)
+
+        guard legacyBase.path != newBase.path else { return }
+
+        func normalizedPrefix(_ path: String) -> String {
+            path.hasSuffix("/") ? path : path + "/"
+        }
+
+        let legacyRecordings = normalizedPrefix(legacyBase.appendingPathComponent("recordings", isDirectory: true).path)
+        let newRecordings = normalizedPrefix(root.path)
+
+        let legacyTimelapses = normalizedPrefix(legacyBase.appendingPathComponent("timelapses", isDirectory: true).path)
+        let newTimelapses = normalizedPrefix(newBase.appendingPathComponent("timelapses", isDirectory: true).path)
+
+        let replacements: [(label: String, table: String, column: String, legacyPrefix: String, newPrefix: String)] = [
+            ("chunk file paths", "chunks", "file_url", legacyRecordings, newRecordings),
+            ("timelapse video paths", "timeline_cards", "video_summary_url", legacyTimelapses, newTimelapses)
+        ]
+
+        do {
+            try timedWrite("migrateLegacyFileURLs") { db in
+                for replacement in replacements {
+                    guard replacement.legacyPrefix != replacement.newPrefix else { continue }
+
+                    let pattern = replacement.legacyPrefix + "%"
+                    let count = try Int.fetchOne(
+                        db,
+                        sql: "SELECT COUNT(*) FROM \(replacement.table) WHERE \(replacement.column) LIKE ?",
+                        arguments: [pattern]
+                    ) ?? 0
+
+                    guard count > 0 else { continue }
+
+                    try db.execute(
+                        sql: """
+                            UPDATE \(replacement.table)
+                            SET \(replacement.column) = REPLACE(\(replacement.column), ?, ?)
+                            WHERE \(replacement.column) LIKE ?
+                        """,
+                        arguments: [replacement.legacyPrefix, replacement.newPrefix, pattern]
+                    )
+
+                    let updated = db.changesCount
+                    print("ℹ️ StorageManager: migrated \(updated) \(replacement.label) to \(replacement.newPrefix)")
+                }
             }
+        } catch {
+            print("⚠️ StorageManager: failed to migrate legacy file URLs: \(error)")
+        }
+    }
+
+    static func migrateDatabaseLocationIfNeeded(
+        fileManager: FileManager,
+        legacyRecordingsDir: URL,
+        newDatabaseURL: URL
+    ) {
+        let destinationDir = newDatabaseURL.deletingLastPathComponent()
+        let filenames = ["chunks.sqlite", "chunks.sqlite-wal", "chunks.sqlite-shm"]
+
+        guard filenames.contains(where: { fileManager.fileExists(atPath: legacyRecordingsDir.appendingPathComponent($0).path) }) else {
+            return
+        }
+
+        if !fileManager.fileExists(atPath: destinationDir.path) {
+            try? fileManager.createDirectory(at: destinationDir, withIntermediateDirectories: true)
+        }
+
+        for name in filenames {
+            let legacyURL = legacyRecordingsDir.appendingPathComponent(name)
+            guard fileManager.fileExists(atPath: legacyURL.path) else { continue }
+
+            let destinationURL = destinationDir.appendingPathComponent(name)
+            do {
+                if fileManager.fileExists(atPath: destinationURL.path) {
+                    try fileManager.removeItem(at: destinationURL)
+                }
+                try fileManager.moveItem(at: legacyURL, to: destinationURL)
+                print("ℹ️ StorageManager: migrated \(name) to \(destinationURL.path)")
+            } catch {
+                print("⚠️ StorageManager: failed to migrate \(name): \(error)")
+            }
+        }
+    }
+}
+
+
+extension FileManager {
+    func allocatedSizeOfDirectory(at url: URL) throws -> Int64 {
+        guard let enumerator = enumerator(
+            at: url,
+            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            do {
+                let values = try fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .isDirectoryKey])
+                if values.isDirectory == true {
+                    // Directories report 0, rely on enumerator to traverse contents
+                    continue
+                }
+                total += Int64(values.totalFileAllocatedSize ?? 0)
+            } catch {
+                continue
+            }
+        }
+        return total
     }
 }

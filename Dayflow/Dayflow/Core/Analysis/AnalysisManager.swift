@@ -8,8 +8,8 @@
 //  • Keeps the public `AnalysisManaging` contract unchanged.
 //
 import Foundation
-import AVFoundation
 import GRDB
+import Sentry
 
 
 protocol AnalysisManaging {
@@ -18,13 +18,14 @@ protocol AnalysisManaging {
     func triggerAnalysisNow()
     func reprocessDay(_ day: String, progressHandler: @escaping (String) -> Void, completion: @escaping (Result<Void, Error>) -> Void)
     func reprocessSpecificBatches(_ batchIds: [Int64], progressHandler: @escaping (String) -> Void, completion: @escaping (Result<Void, Error>) -> Void)
+    func reprocessBatch(_ batchId: Int64, stepHandler: @escaping (LLMProcessingStep) -> Void, completion: @escaping (Result<Void, Error>) -> Void)
 }
 
 
 final class AnalysisManager: AnalysisManaging {
     static let shared = AnalysisManager()
     private let videoProcessingService: VideoProcessingService
-    
+
     private init() {
         store = StorageManager.shared
         llmService = LLMService.shared
@@ -33,12 +34,12 @@ final class AnalysisManager: AnalysisManaging {
 
     private let store: any StorageManaging
     private let llmService: any LLMServicing
-    
+
     // Video Processing Constants - removed old summary generation
 
     private let checkInterval: TimeInterval = 60          // every minute
-    private let targetBatchDuration: TimeInterval = 15*60 // ≈15‑min logical batches
     private let maxLookback: TimeInterval   = 24*60*60    // only last 24h
+    // Note: targetBatchDuration and maxGap are now provider-specific via llmService.batchingConfig
 
     private var analysisTimer: Timer?
     private var isProcessing = false
@@ -66,75 +67,70 @@ final class AnalysisManager: AnalysisManaging {
         guard !isProcessing else { return }
         queue.async { [weak self] in self?.processRecordings() }
     }
-    
+
     func reprocessDay(_ day: String, progressHandler: @escaping (String) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
         queue.async { [weak self] in
-            guard let self = self else { 
+            guard let self = self else {
                 completion(.failure(NSError(domain: "AnalysisManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Manager deallocated"])))
-                return 
+                return
             }
-            
+
             let overallStartTime = Date()
             var batchTimings: [(batchId: Int64, duration: TimeInterval)] = []
-            
+
             DispatchQueue.main.async { progressHandler("Preparing to reprocess day \(day)...") }
-            
+
             // 1. Delete existing timeline cards and get video paths to clean up
             let videoPaths = self.store.deleteTimelineCards(forDay: day)
-            
+
             // 2. Clean up video files
             for path in videoPaths {
                 if let url = URL(string: path) {
                     try? FileManager.default.removeItem(at: url)
                 }
             }
-            
+
             DispatchQueue.main.async { progressHandler("Deleted \(videoPaths.count) video files") }
-            
+
             // 3. Get all batch IDs for the day before resetting
             let batches = self.store.fetchBatches(forDay: day)
             let batchIds = batches.map { $0.id }
-            
+
             if batchIds.isEmpty {
-                DispatchQueue.main.async { 
+                DispatchQueue.main.async {
                     progressHandler("No batches found for day \(day)")
                     completion(.success(()))
                 }
                 return
             }
-            
+
             // 4. Delete observations for these batches
             self.store.deleteObservations(forBatchIds: batchIds)
             DispatchQueue.main.async { progressHandler("Deleted observations for \(batchIds.count) batches") }
-            
+
             // 5. Reset batch statuses to pending
             let resetBatchIds = self.store.resetBatchStatuses(forDay: day)
             DispatchQueue.main.async { progressHandler("Reset \(resetBatchIds.count) batches to pending status") }
-            
+
             // 6. Process each batch sequentially
             var processedCount = 0
-            var hasError = false
-            
+
             for (index, batchId) in batchIds.enumerated() {
-                if hasError { break }
-                
+
                 let batchStartTime = Date()
                 let elapsedTotal = Date().timeIntervalSince(overallStartTime)
-                
-                DispatchQueue.main.async { 
+
+                DispatchQueue.main.async {
                     progressHandler("Processing batch \(index + 1) of \(batchIds.count)... (Total elapsed: \(self.formatDuration(elapsedTotal)))")
                 }
-                
-                // Use a semaphore to wait for each batch to complete
-                let semaphore = DispatchSemaphore(value: 0)
-                
+
                 self.queueGeminiRequest(batchId: batchId)
-                
+
                 // Wait for batch to complete (check status periodically)
                 var isCompleted = false
-                while !isCompleted && !hasError {
+                while !isCompleted {
                     Thread.sleep(forTimeInterval: 2.0) // Check every 2 seconds
-                    
+
                     let currentBatches = self.store.fetchBatches(forDay: day)
                     if let batch = currentBatches.first(where: { $0.id == batchId }) {
                         switch batch.status {
@@ -165,105 +161,88 @@ final class AnalysisManager: AnalysisManaging {
                     }
                 }
             }
-            
+
             let totalDuration = Date().timeIntervalSince(overallStartTime)
-            
+
             DispatchQueue.main.async {
                 // Build summary with timing stats
                 var summary = "\n📊 Reprocessing Summary:\n"
                 summary += "Total batches: \(batchIds.count)\n"
                 summary += "Processed: \(processedCount)\n"
                 summary += "Total time: \(self.formatDuration(totalDuration))\n"
-                
+
                 if !batchTimings.isEmpty {
                     summary += "\nBatch timings:\n"
                     for (index, timing) in batchTimings.enumerated() {
                         summary += "  Batch \(index + 1): \(self.formatDuration(timing.duration))\n"
                     }
-                    
+
                     let avgTime = batchTimings.map { $0.duration }.reduce(0, +) / Double(batchTimings.count)
                     summary += "\nAverage time per batch: \(self.formatDuration(avgTime))"
                 }
-                
+
                 progressHandler(summary)
-                
-                if hasError {
-                    completion(.failure(NSError(domain: "AnalysisManager", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to reprocess some batches"])))
-                } else {
-                    completion(.success(()))
-                }
+                completion(.success(()))
             }
         }
     }
-    
+
     func reprocessSpecificBatches(_ batchIds: [Int64], progressHandler: @escaping (String) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
         queue.async { [weak self] in
-            guard let self = self else { 
+            guard let self = self else {
                 completion(.failure(NSError(domain: "AnalysisManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Manager deallocated"])))
-                return 
+                return
             }
-            
+
             let overallStartTime = Date()
             var batchTimings: [(batchId: Int64, duration: TimeInterval)] = []
-            
+
             DispatchQueue.main.async { progressHandler("Preparing to reprocess \(batchIds.count) selected batches...") }
-            
-            // Delete all timeline cards for the day (since they can be merged across batches)
-            DispatchQueue.main.async { progressHandler("Deleting existing timeline cards for the day...") }
-            
-            // Get the day string from the first batch
+
             let allBatches = self.store.allBatches()
-            guard let firstBatch = allBatches.first(where: { batchIds.contains($0.id) }) else {
+            let existingBatchIds = Set(allBatches.map { $0.id })
+            let orderedBatchIds = batchIds.filter { existingBatchIds.contains($0) }
+
+            guard !orderedBatchIds.isEmpty else {
                 completion(.failure(NSError(domain: "AnalysisManager", code: 3, userInfo: [NSLocalizedDescriptionKey: "Could not find batch information"])))
                 return
             }
-            
-            // Convert timestamp to day string
-            let date = Date(timeIntervalSince1970: TimeInterval(firstBatch.start))
-            let calendar = Calendar.current
-            let hour = calendar.component(.hour, from: date)
-            let logicalDate = hour < 4 ? calendar.date(byAdding: .day, value: -1, to: date) ?? date : date
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
-            let dayString = formatter.string(from: logicalDate)
-            
-            let videoPaths = self.store.deleteTimelineCards(forDay: dayString)
-            
-            // Delete observations
-            self.store.deleteObservations(forBatchIds: batchIds)
-            
-            // Delete video files
-            for path in videoPaths {
-                if let url = URL(string: path) {
-                    try? FileManager.default.removeItem(at: url)
-                }
+
+            // Delete observations so they can be regenerated
+            // Note: We don't delete timeline cards here - LLMService.processBatch's
+            // replaceTimelineCardsInRange() handles atomic card replacement, keeping
+            // the old card visible until new cards are ready
+            self.store.deleteObservations(forBatchIds: orderedBatchIds)
+
+            let resetBatchIdSet = Set(self.store.resetBatchStatuses(forBatchIds: orderedBatchIds))
+            let batchesToProcess = orderedBatchIds.filter { resetBatchIdSet.contains($0) }
+
+            guard !batchesToProcess.isEmpty else {
+                DispatchQueue.main.async { progressHandler("No eligible batches found to reprocess.") }
+                completion(.failure(NSError(domain: "AnalysisManager", code: 4, userInfo: [NSLocalizedDescriptionKey: "No eligible batches found to reprocess"])))
+                return
             }
-            
-            // Reset batch statuses
-            
-            DispatchQueue.main.async { progressHandler("Processing \(batchIds.count) batches...") }
-            
+
+            DispatchQueue.main.async { progressHandler("Processing \(batchesToProcess.count) batches...") }
+
             // Process batches
             var processedCount = 0
-            var hasError = false
-            
-            for (index, batchId) in batchIds.enumerated() {
-                if hasError { break }
-                
+
+            for (index, batchId) in batchesToProcess.enumerated() {
                 let batchStartTime = Date()
                 let elapsedTotal = Date().timeIntervalSince(overallStartTime)
-                
-                DispatchQueue.main.async { 
-                    progressHandler("Processing batch \(index + 1) of \(batchIds.count)... (Total elapsed: \(self.formatDuration(elapsedTotal)))")
+
+                DispatchQueue.main.async {
+                    progressHandler("Processing batch \(index + 1) of \(batchesToProcess.count)... (Total elapsed: \(self.formatDuration(elapsedTotal)))")
                 }
-                
+
                 self.queueGeminiRequest(batchId: batchId)
-                
+
                 // Wait for batch to complete (check status periodically)
                 var isCompleted = false
-                while !isCompleted && !hasError {
+                while !isCompleted {
                     Thread.sleep(forTimeInterval: 2.0) // Check every 2 seconds
-                    
+
                     let allBatches = self.store.allBatches()
                     if let batch = allBatches.first(where: { $0.id == batchId }) {
                         switch batch.status {
@@ -294,21 +273,52 @@ final class AnalysisManager: AnalysisManaging {
                     }
                 }
             }
-            
+
             // Summary
             let totalDuration = Date().timeIntervalSince(overallStartTime)
             let avgDuration = batchTimings.isEmpty ? 0 : batchTimings.reduce(0) { $0 + $1.duration } / Double(batchTimings.count)
-            
+
             DispatchQueue.main.async {
                 progressHandler("""
                 ✅ Reprocessing complete!
-                • Processed: \(processedCount) of \(batchIds.count) batches
+                • Processed: \(processedCount) of \(batchesToProcess.count) batches
                 • Total time: \(self.formatDuration(totalDuration))
                 • Average time per batch: \(self.formatDuration(avgDuration))
                 """)
             }
-            
+
             completion(.success(()))
+        }
+    }
+
+    func reprocessBatch(_ batchId: Int64, stepHandler: @escaping (LLMProcessingStep) -> Void, completion: @escaping (Result<Void, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self = self else {
+                DispatchQueue.main.async {
+                    completion(.failure(NSError(domain: "AnalysisManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Manager deallocated"])))
+                }
+                return
+            }
+
+            // Reset batch state and clear observations
+            self.store.deleteObservations(forBatchIds: [batchId])
+            let resetBatchIds = Set(self.store.resetBatchStatuses(forBatchIds: [batchId]))
+            guard resetBatchIds.contains(batchId) else {
+                DispatchQueue.main.async {
+                    completion(.failure(NSError(domain: "AnalysisManager", code: 4, userInfo: [NSLocalizedDescriptionKey: "No eligible batches found to reprocess"])))
+                }
+                return
+            }
+
+            self.queueGeminiRequest(
+                batchId: batchId,
+                progressHandler: stepHandler,
+                completion: { result in
+                    DispatchQueue.main.async {
+                        completion(result)
+                    }
+                }
+            )
         }
     }
 
@@ -319,50 +329,77 @@ final class AnalysisManager: AnalysisManaging {
         guard !isProcessing else { return }; isProcessing = true
         defer { isProcessing = false }
 
-        // 1. Gather unprocessed chunks
-        let chunks = fetchUnprocessedChunks()
-        // 2. Build logical batches (~15‑min)
-        let batches = createBatches(from: chunks)
+        // 1. Gather unprocessed screenshots
+        let screenshots = fetchUnprocessedScreenshots()
+        // 2. Build logical batches (duration based on provider config)
+        let batches = createScreenshotBatches(from: screenshots)
         // 3. Persist batch rows & join table
-        let batchIDs = batches.compactMap(saveBatch)
+        let batchIDs = batches.compactMap(saveScreenshotBatch)
         // 4. Fire LLM for each batch
         for id in batchIDs { queueGeminiRequest(batchId: id) }
     }
 
 
-    private func queueGeminiRequest(batchId: Int64) {
-        let chunksInBatch = StorageManager.shared.chunksForBatch(batchId)
+    private func queueGeminiRequest(
+        batchId: Int64,
+        progressHandler: ((LLMProcessingStep) -> Void)? = nil,
+        completion: ((Result<Void, Error>) -> Void)? = nil
+    ) {
+        let screenshotsInBatch = StorageManager.shared.screenshotsForBatch(batchId)
 
-        if chunksInBatch.isEmpty {
-            print("Warning: Batch \(batchId) has no chunks. Marking as 'failed_empty'.")
+        guard !screenshotsInBatch.isEmpty else {
+            print("Warning: Batch \(batchId) has no screenshots. Marking as 'failed_empty'.")
             self.updateBatchStatus(batchId: batchId, status: "failed_empty")
+            completion?(.success(()))
             return
         }
 
-        let totalVideoDurationSeconds = chunksInBatch.reduce(0.0) { acc, chunk -> TimeInterval in
-            let duration = TimeInterval(chunk.endTs - chunk.startTs)
-            return acc + duration
+        let itemCount = screenshotsInBatch.count
+        let totalDurationSeconds: TimeInterval
+        if let first = screenshotsInBatch.first, let last = screenshotsInBatch.last {
+            totalDurationSeconds = TimeInterval(last.capturedAt - first.capturedAt)
+        } else {
+            totalDurationSeconds = 0
+        }
+
+        if itemCount == 0 {
+            print("Warning: Batch \(batchId) has no data. Marking as 'failed_empty'.")
+            self.updateBatchStatus(batchId: batchId, status: "failed_empty")
+            completion?(.success(()))
+            return
         }
 
         let minimumDurationSeconds: TimeInterval = 300.0 // 5 minutes
 
-        if totalVideoDurationSeconds < minimumDurationSeconds {
-            print("Batch \(batchId) duration (\(totalVideoDurationSeconds)s) is less than \(minimumDurationSeconds)s. Marking as 'skipped_short'.")
+        if totalDurationSeconds < minimumDurationSeconds {
+            print("Batch \(batchId) duration (\(totalDurationSeconds)s) is less than \(minimumDurationSeconds)s. Marking as 'skipped_short'.")
             self.updateBatchStatus(batchId: batchId, status: "skipped_short")
+            completion?(.success(()))
             return
         }
 
+        // Start performance tracking for batch processing
+        let transaction = SentrySDK.startTransaction(
+            name: "batch_processing",
+            operation: "llm.batch"
+        )
+        transaction.setData(value: batchId, key: "batch_id")
+        transaction.setData(value: itemCount, key: "screenshot_count")
+        transaction.setData(value: totalDurationSeconds, key: "duration_s")
+
+        // Add breadcrumb for batch processing start
+        let breadcrumb = Breadcrumb(level: .info, category: "analysis")
+        breadcrumb.message = "Starting batch \(batchId) processing"
+        breadcrumb.data = [
+            "mode": "screenshots",
+            "count": itemCount,
+            "duration_s": totalDurationSeconds
+        ]
+        SentrySDK.addBreadcrumb(breadcrumb)
+
         updateBatchStatus(batchId: batchId, status: "processing")
 
-        // Prepare file URLs for video processing
-        let chunkFileURLs: [URL] = chunksInBatch.compactMap { chunk in
-            // Assuming chunk.fileUrl is a String path, convert to URL
-            // Ensure this path is accessible. If it's a relative path, resolve it.
-            // For now, assuming it's an absolute file path string.
-            URL(fileURLWithPath: chunk.fileUrl)
-        }
-
-        llmService.processBatch(batchId) { [weak self] (result: Result<ProcessedBatchResult, Error>) in
+        llmService.processBatch(batchId, progressHandler: progressHandler) { [weak self] (result: Result<ProcessedBatchResult, Error>) in
             guard let self else { return }
 
             let now = Date()
@@ -375,7 +412,10 @@ final class AnalysisManager: AnalysisManaging {
                 let activityCards = processedResult.cards
                 let cardIds = processedResult.cardIds
                 print("LLM succeeded for Batch \(batchId). Processing \(activityCards.count) activity cards for day \(currentLogicalDayString).")
-                
+
+                // Finish performance transaction - LLM processing completed successfully
+                transaction.finish(status: .ok)
+
                 // Debug: Check for duplicate cards from LLM
                 print("\n🔍 DEBUG: Checking for duplicate cards from LLM:")
                 for (i, card1) in activityCards.enumerated() {
@@ -386,70 +426,62 @@ final class AnalysisManager: AnalysisManaging {
                     }
                 }
                 print("✅ DEBUG: Duplicate check complete\n")
-                
-                guard let firstChunk = chunksInBatch.first else {
-                    print("Error: No chunks found for batch \(batchId) during timestamp conversion")
-                    self.markBatchFailed(batchId: batchId, reason: "No chunks found for timestamp conversion")
-                    return
-                }
-                let firstChunkStartDate = Date(timeIntervalSince1970: TimeInterval(firstChunk.startTs))
-                print("First chunk starts at real time: \(firstChunkStartDate)")
 
                 // Mark batch as completed immediately
                 self.updateBatchStatus(batchId: batchId, status: "completed")
-                
-                // Generate timelapses asynchronously for each timeline card
-                Task { @MainActor in
+
+                let cardCount = activityCards.count
+
+                // Generate timelapses asynchronously for each timeline card off the main thread
+                Task.detached(priority: .utility) { [weak self, cardIds, cardCount, batchId] in
+                    guard let self else { return }
+
                     for (index, cardId) in cardIds.enumerated() {
-                        guard index < activityCards.count else { continue }
-                        
+                        if index >= cardCount { continue }
+
                         // Fetch the saved timeline card to get Unix timestamps
                         guard let timelineCard = self.store.fetchTimelineCard(byId: cardId) else {
                             print("Warning: Could not fetch timeline card \(cardId)")
                             continue
                         }
-                        
-                        // Fetch chunks that overlap with this card's time range using Unix timestamps
-                        let chunks = self.store.fetchChunksInTimeRange(
+
+                        // Fetch screenshots for this card's time range
+                        let screenshots = self.store.fetchScreenshotsInTimeRange(
                             startTs: timelineCard.startTs,
                             endTs: timelineCard.endTs
                         )
-                        
-                        if chunks.isEmpty {
-                            print("No chunks found for timeline card \(cardId) [\(timelineCard.startTimestamp) - \(timelineCard.endTimestamp)]")
+
+                        if screenshots.isEmpty {
+                            print("No screenshots found for timeline card \(cardId) [\(timelineCard.startTimestamp) - \(timelineCard.endTimestamp)]")
                             continue
                         }
-                        
+
                         do {
                             print("Generating timelapse for card \(cardId): '\(timelineCard.title)' [\(timelineCard.startTimestamp) - \(timelineCard.endTimestamp)]")
-                            print("  Found \(chunks.count) chunks in time range")
-                            
-                            // Convert chunks to URLs
-                            let chunkURLs = chunks.compactMap { URL(fileURLWithPath: $0.fileUrl) }
-                            
-                            // Stitch chunks together
-                            let stitchedVideo = try await self.videoProcessingService.prepareVideoForProcessing(urls: chunkURLs)
-                            print("  Stitched video prepared at: \(stitchedVideo.path)")
-                            
-                            // Generate timelapse
+                            print("  Found \(screenshots.count) screenshots in time range")
+
+                            // Generate timelapse URL
                             let timelapseURL = await self.videoProcessingService.generatePersistentTimelapseURL(
                                 for: Date(timeIntervalSince1970: TimeInterval(timelineCard.startTs)),
                                 originalFileName: String(cardId)
                             )
-                            
-                            try await self.videoProcessingService.generateTimelapse(
-                                sourceVideoURL: stitchedVideo,
-                                outputTimelapseFileURL: timelapseURL,
-                                speedupFactor: 20,  // 20x as requested
-                                outputFPS: 24
+
+                            // Directly composite screenshots into timelapse at correct fps
+                            // Screenshots are 10s apart. For 20x base speed: fps = 20/10 = 2
+                            // Player can then do 1x (20x real), 2x (40x real), 3x (60x real)
+                            try await self.videoProcessingService.generateVideoFromScreenshots(
+                                screenshots: screenshots,
+                                outputURL: timelapseURL,
+                                fps: 2,
+                                useCompressedTimeline: true
                             )
-                            
+
                             // Update timeline card with timelapse URL
-                            self.store.updateTimelineCardVideoURL(cardId: cardId, videoSummaryURL: timelapseURL.path)
-                            print("✅ Generated timelapse for card \(cardId): \(timelapseURL.path)")
-                            
-                            // Cleanup temp file
-                            await self.videoProcessingService.cleanupTemporaryFile(at: stitchedVideo)
+                            let videoPath = timelapseURL.path
+                            DispatchQueue.global(qos: .utility).async { [store = self.store] in
+                                store.updateTimelineCardVideoURL(cardId: cardId, videoSummaryURL: videoPath)
+                            }
+                            print("✅ Generated timelapse for card \(cardId): \(videoPath)")
                         } catch {
                             print("❌ Error generating timelapse for card \(cardId): \(error)")
                         }
@@ -457,9 +489,16 @@ final class AnalysisManager: AnalysisManaging {
                     print("✅ Timelapse generation complete for batch \(batchId)")
                 }
 
+                completion?(.success(()))
+
             case .failure(let err):
                 print("LLM failed for Batch \(batchId). Day \(currentLogicalDayString) may have been cleared. Error: \(err.localizedDescription)")
+
+                // Finish performance transaction - LLM processing failed
+                transaction.finish(status: .internalError)
+
                 self.markBatchFailed(batchId: batchId, reason: err.localizedDescription)
+                completion?(.failure(err))
             }
         }
     }
@@ -474,80 +513,90 @@ final class AnalysisManager: AnalysisManaging {
     }
 
 
-    private struct AnalysisBatch { let chunks: [RecordingChunk]; let start: Int; let end: Int }
+    // MARK: - Screenshot-based Batching
 
-    private func fetchUnprocessedChunks() -> [RecordingChunk] {
+    private struct ScreenshotBatch {
+        let screenshots: [Screenshot]
+        let start: Int
+        let end: Int
+
+        /// Duration covered by this batch (based on timestamp range)
+        var duration: TimeInterval {
+            TimeInterval(end - start)
+        }
+
+        /// Number of screenshots in the batch
+        var count: Int { screenshots.count }
+    }
+
+    private func fetchUnprocessedScreenshots() -> [Screenshot] {
         let oldest = Int(Date().timeIntervalSince1970) - Int(maxLookback)
-        return store.fetchUnprocessedChunks(olderThan: oldest)
+        return store.fetchUnprocessedScreenshots(since: oldest)
     }
 
+    private func createScreenshotBatches(from screenshots: [Screenshot]) -> [ScreenshotBatch] {
+        guard !screenshots.isEmpty else { return [] }
 
-private func createBatches(from chunks: [RecordingChunk]) -> [AnalysisBatch] {
-    guard !chunks.isEmpty else { return [] }
+        let ordered = screenshots.sorted { $0.capturedAt < $1.capturedAt }
+        let config = llmService.batchingConfig
+        let maxGap: TimeInterval = config.maxGap
+        let maxBatchDuration: TimeInterval = config.targetDuration
 
-    let ordered = chunks.sorted { $0.startTs < $1.startTs }
-    let maxGap: TimeInterval        = 120             // ≤ 2 min between chunks
-    let maxBatchDuration: TimeInterval = targetBatchDuration // 900 s (15 min)
+        var batches: [ScreenshotBatch] = []
+        var bucket: [Screenshot] = []
 
-    var batches: [AnalysisBatch] = []
+        for screenshot in ordered {
+            if bucket.isEmpty {
+                bucket.append(screenshot)
+                continue
+            }
 
-    var bucket: [RecordingChunk]   = []
-    var bucketDur: TimeInterval    = 0                // sum of 15‑s chunks
+            let prev = bucket.last!
+            let gap = TimeInterval(screenshot.capturedAt - prev.capturedAt)
+            let currentDuration = TimeInterval(screenshot.capturedAt - bucket.first!.capturedAt)
+            let wouldBurst = currentDuration > maxBatchDuration
 
-    for chunk in ordered {
-        if bucket.isEmpty {
-            bucket.append(chunk)
-            bucketDur = chunk.duration                // first chunk → 15 s
-            continue
+            if gap > maxGap || wouldBurst {
+                // Close current batch
+                batches.append(
+                    ScreenshotBatch(
+                        screenshots: bucket,
+                        start: bucket.first!.capturedAt,
+                        end: bucket.last!.capturedAt
+                    )
+                )
+                // Start new bucket
+                bucket = [screenshot]
+            } else {
+                bucket.append(screenshot)
+            }
         }
 
-        let prev       = bucket.last!
-        let gap        = TimeInterval(chunk.startTs - prev.endTs)
-        let wouldBurst = bucketDur + chunk.duration > maxBatchDuration
-
-        if gap > maxGap || wouldBurst {
-            // close current batch
+        // Flush any leftover bucket
+        if !bucket.isEmpty {
             batches.append(
-                AnalysisBatch(chunks: bucket,
-                              start: bucket.first!.startTs,
-                              end:   bucket.last!.endTs)
+                ScreenshotBatch(
+                    screenshots: bucket,
+                    start: bucket.first!.capturedAt,
+                    end: bucket.last!.capturedAt
+                )
             )
-            // start new bucket with this chunk
-            bucket      = [chunk]
-            bucketDur   = chunk.duration
-        } else {
-            // still in same batch
-            bucket.append(chunk)
-            bucketDur += chunk.duration
         }
-    }
 
-    // Flush any leftover bucket
-    if !bucket.isEmpty {
-        batches.append(
-            AnalysisBatch(chunks: bucket,
-                          start: bucket.first!.startTs,
-                          end:   bucket.last!.endTs)
-        )
-    }
-
-    // ─── Special rule: drop the *most‑recent* batch if < 15 min ───
-    if let last = batches.last {
-        let dur = last.chunks.reduce(0) { $0 + $1.duration }   // sum of 15‑s chunks
-        if dur < maxBatchDuration {
-            batches.removeLast()
+        // Drop the most-recent batch if incomplete (not enough data yet)
+        if let last = batches.last {
+            if last.duration < maxBatchDuration {
+                batches.removeLast()
+            }
         }
+
+        return batches
     }
 
-    return batches
-}
-
-
-    private func saveBatch(_ batch: AnalysisBatch) -> Int64? {
-        let ids = batch.chunks.map { $0.id }
-        return store.saveBatch(startTs: batch.start, endTs: batch.end, chunkIds: ids)
+    private func saveScreenshotBatch(_ batch: ScreenshotBatch) -> Int64? {
+        let ids = batch.screenshots.map { $0.id }
+        return store.saveBatchWithScreenshots(startTs: batch.start, endTs: batch.end, screenshotIds: ids)
     }
-
 
     // Parses a video timestamp like "05:30" into seconds
     private func parseVideoTimestamp(_ timestamp: String) -> TimeInterval? {
@@ -557,7 +606,7 @@ private func createBatches(from chunks: [RecordingChunk]) -> [AnalysisBatch] {
               let seconds = Int(components[1]) else {
             return nil
         }
-        
+
         return TimeInterval(minutes * 60 + seconds)
     }
 
@@ -568,29 +617,29 @@ private func createBatches(from chunks: [RecordingChunk]) -> [AnalysisBatch] {
         formatter.timeZone = TimeZone.current
         return formatter.string(from: date)
     }
-    
+
     // Parses a clock time like "11:37 AM" to a Date
     private func parseClockTime(_ timeString: String, baseDate: Date) -> Date? {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        
+
         guard let time = formatter.date(from: timeString) else { return nil }
-        
+
         let calendar = Calendar.current
         let timeComponents = calendar.dateComponents([.hour, .minute], from: time)
-        
+
         return calendar.date(bySettingHour: timeComponents.hour ?? 0,
                            minute: timeComponents.minute ?? 0,
                            second: 0,
                            of: baseDate)
     }
-    
+
     // Formats a duration in seconds to a human-readable string
     private func formatDuration(_ seconds: TimeInterval) -> String {
         let minutes = Int(seconds) / 60
         let remainingSeconds = Int(seconds) % 60
-        
+
         if minutes > 0 {
             return "\(minutes)m \(remainingSeconds)s"
         } else {

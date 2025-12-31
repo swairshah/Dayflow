@@ -6,7 +6,6 @@
 import Foundation
 import Combine
 import AppKit
-import AVFoundation
 import SwiftUI
 import GRDB
 
@@ -15,100 +14,84 @@ struct ProcessedBatchResult {
     let cardIds: [Int64]
 }
 
+enum LLMProcessingStep: Sendable, Equatable {
+    case transcribing
+    case generatingCards
+}
+
 protocol LLMServicing {
-    func processBatch(_ batchId: Int64, completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void)
+    func processBatch(_ batchId: Int64, progressHandler: ((LLMProcessingStep) -> Void)?, completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void)
+    func generateText(prompt: String) async throws -> String
+    var batchingConfig: BatchingConfig { get }
 }
 
 final class LLMService: LLMServicing {
     static let shared: LLMServicing = LLMService()
     
     private var providerType: LLMProviderType {
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        print("\n🔍 [LLMService] Reading provider type at \(timestamp)")
-        
         guard let savedData = UserDefaults.standard.data(forKey: "llmProviderType") else {
-            print("⚠️ [LLMService] No saved provider type in UserDefaults - defaulting to Gemini")
             return .geminiDirect
         }
-        
-        print("✅ [LLMService] Found provider data in UserDefaults: \(savedData.count) bytes")
-        
+
         do {
-            let decoded = try JSONDecoder().decode(LLMProviderType.self, from: savedData)
-            print("✅ [LLMService] Successfully decoded provider type: \(decoded)")
-            return decoded
+            return try JSONDecoder().decode(LLMProviderType.self, from: savedData)
         } catch {
             print("❌ [LLMService] Failed to decode provider type: \(error)")
-            print("   Raw data (hex): \(savedData.map { String(format: "%02x", $0) }.joined())")
             return .geminiDirect
         }
     }
     
     private var provider: LLMProvider? {
-        let type = providerType
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        print("\n🏗️ [LLMService] Creating provider at \(timestamp)")
-        print("   Provider type: \(type)")
-        
-        switch type {
+        switch providerType {
         case .geminiDirect:
-            print("🔑 [LLMService] Attempting to retrieve Gemini API key from Keychain...")
-            
-            // Try to retrieve API key with detailed logging
-            if let apiKey = KeychainManager.shared.retrieve(for: "gemini") {
-                print("✅ [LLMService] API key retrieved from Keychain")
-                print("   Key length: \(apiKey.count) characters")
-                print("   Key prefix: \(apiKey.prefix(8))...")
-                
-                if apiKey.isEmpty {
-                    print("❌ [LLMService] API key is empty string - cannot create provider")
-                    return nil
-                }
-                
-                print("✅ [LLMService] Creating GeminiDirectProvider with valid API key")
-                return GeminiDirectProvider(apiKey: apiKey)
-            } else {
-                print("❌ [LLMService] Failed to retrieve API key from Keychain")
-                print("   This might be due to:")
-                print("   - Keychain access timing issue")
-                print("   - Sandbox restrictions")
-                print("   - Security context mismatch")
-                
-                // Try to check if UserDefaults is accessible
-                if let _ = UserDefaults.standard.object(forKey: "llmProviderType") {
-                    print("   ✅ UserDefaults IS accessible")
-                } else {
-                    print("   ❌ UserDefaults also appears inaccessible")
-                }
-                
-                return nil
-            }
-            
+            return makeGeminiProvider()
         case .dayflowBackend(let endpoint):
-            print("🔑 [LLMService] Attempting to retrieve Dayflow token from Keychain...")
-            print("   Endpoint: \(endpoint)")
-            
-            if let token = KeychainManager.shared.retrieve(for: "dayflow") {
-                print("✅ [LLMService] Token retrieved (length: \(token.count))")
-                if token.isEmpty {
-                    print("❌ [LLMService] Token is empty string")
-                    return nil
-                }
+            if let token = KeychainManager.shared.retrieve(for: "dayflow"), !token.isEmpty {
                 return DayflowBackendProvider(token: token, endpoint: endpoint)
             } else {
                 print("❌ [LLMService] Failed to retrieve Dayflow token from Keychain")
                 return nil
             }
-            
+
         case .ollamaLocal(let endpoint):
-            print("🦙 [LLMService] Creating OllamaProvider")
-            print("   Endpoint: \(endpoint)")
             return OllamaProvider(endpoint: endpoint)
+        case .chatGPTClaude:
+            let preferredTool = UserDefaults.standard.string(forKey: "chatCLIPreferredTool") ?? "codex"
+            let tool: ChatCLITool = (preferredTool == "claude") ? .claude : .codex
+            return ChatCLIProvider(tool: tool)
+        }
+    }
+    
+    private func makeGeminiProvider() -> LLMProvider? {
+        if let apiKey = KeychainManager.shared.retrieve(for: "gemini"), !apiKey.isEmpty {
+            let preference = GeminiModelPreference.load()
+            return GeminiDirectProvider(apiKey: apiKey, preference: preference)
+        } else {
+            print("❌ [LLMService] Failed to retrieve Gemini API key from Keychain")
+            return nil
+        }
+    }
+
+    private func providerName() -> String {
+        switch providerType {
+        case .geminiDirect: return "gemini"
+        case .dayflowBackend: return "dayflow"
+        case .ollamaLocal: return "ollama"
+        case .chatGPTClaude: return "chat_cli"
+        }
+    }
+
+    var batchingConfig: BatchingConfig {
+        switch providerType {
+        case .geminiDirect:
+            return .gemini    // 30 min batches, 5 min gap (rate limited)
+        default:
+            return .standard  // 15 min batches, 2 min gap
         }
     }
     
     // Keep the existing processBatch implementation for backward compatibility
-    func processBatch(_ batchId: Int64, completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void) {
+    func processBatch(_ batchId: Int64, progressHandler: ((LLMProcessingStep) -> Void)? = nil, completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void) {
         Task {
             // Get batch info first (outside do-catch so it's available in catch block)
             let batches = StorageManager.shared.allBatches()
@@ -125,113 +108,60 @@ final class LLMService: LLMServicing {
                 print("   Batch time: \(Date(timeIntervalSince1970: TimeInterval(batchStartTs))) to \(Date(timeIntervalSince1970: TimeInterval(batchEndTs)))")
 
                 // Track analysis batch started
-                await AnalyticsService.shared.capture("analysis_batch_started", [
+                AnalyticsService.shared.capture("analysis_batch_started", [
                     "batch_id": batchId,
-                    "total_duration_seconds": batchEndTs - batchStartTs
+                    "total_duration_seconds": batchEndTs - batchStartTs,
+                    "llm_provider": providerName()
                 ])
                 
                 // Check provider inside the do block so errors go through catch
                 guard let provider = provider else {
-                    print("❌ [LLMService] Provider is nil - checking diagnostics:")
-                    
-                    // Additional diagnostic checks
-                    if let data = UserDefaults.standard.data(forKey: "llmProviderType") {
-                        print("   ✅ UserDefaults has llmProviderType: \(data.count) bytes")
-                        if let str = String(data: data, encoding: .utf8) {
-                            print("   Content: \(str)")
-                        }
-                    } else {
-                        print("   ❌ UserDefaults missing llmProviderType")
-                    }
-                    
-                    // Try direct Keychain check
-                    print("   Attempting direct Keychain check...")
-                    let directCheck = KeychainManager.shared.retrieve(for: "gemini")
-                    if directCheck != nil {
-                        print("   ✅ Direct Keychain check succeeded")
-                    } else {
-                        print("   ❌ Direct Keychain check failed")
-                    }
-                    
                     throw NSError(domain: "LLMService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No LLM provider configured. Please configure in settings."])
                 }
                 
                 // Mark batch as processing
                 StorageManager.shared.updateBatch(batchId, status: "processing")
-                
-                // Get chunk file paths for this batch
-                let chunkFiles = StorageManager.shared.getChunkFilesForBatch(batchId: batchId)
-                
-                guard !chunkFiles.isEmpty else {
-                    throw NSError(domain: "LLMService", code: 3, userInfo: [NSLocalizedDescriptionKey: "No recordings in batch"])
-                }
-                
-                // Combine all video files
-                
-                // Create a combined video for transcription
-                let composition = AVMutableComposition()
-                var compositionTime = CMTime.zero
-                
-                // Combining video chunks
-                
-                // Create a single video track for all chunks
-                guard let compositionTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-                    throw NSError(domain: "LLMService", code: 6, userInfo: [NSLocalizedDescriptionKey: "Failed to create composition track"])
-                }
-                
-                for (index, filePath) in chunkFiles.enumerated() {
-                    let url = URL(fileURLWithPath: filePath)
-                    
-                    let asset = AVAsset(url: url)
-                    let duration = try await asset.load(.duration)
-                    let durationSeconds = CMTimeGetSeconds(duration)
-                    
-        
-                    if let track = try await asset.loadTracks(withMediaType: .video).first {
-                        try compositionTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: track, at: compositionTime)
-                    }
-                    
-                    compositionTime = CMTimeAdd(compositionTime, duration)
-                }
-                
-                let totalDuration = CMTimeGetSeconds(compositionTime)
-                // Export combined video to temporary file
-                let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mp4")
-                
-                guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-                    throw NSError(domain: "LLMService", code: 4, userInfo: [NSLocalizedDescriptionKey: "Failed to create video exporter"])
-                }
-                
-                exporter.outputURL = tempURL
-                exporter.outputFileType = .mp4
-                
-                await exporter.export()
-                
-                guard exporter.status == .completed else {
-                    throw NSError(domain: "LLMService", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to export combined video"])
-                }
-                
-                let videoData = try Data(contentsOf: tempURL)
-                let mimeType = "video/mp4"
+
                 // Get batch start time for timestamp conversion
                 let batchStartDate = Date(timeIntervalSince1970: TimeInterval(batchStartTs))
-                
-                let (observations, transcribeLog) = try await provider.transcribeVideo(
-                    videoData: videoData,
-                    mimeType: mimeType,
-                    prompt: "Transcribe this video", // Provider will use its own prompt
-                    batchStartTime: batchStartDate,
-                    videoDuration: totalDuration,
-                    batchId: batchId
-                )
-                
-                // Clean up temp file after transcription is complete
-                try? FileManager.default.removeItem(at: tempURL)
+
+                // Try screenshot-based transcription first (new system)
+                let screenshots = StorageManager.shared.screenshotsForBatch(batchId)
+                var observations: [Observation]
+                var transcribeLog: LLMCall
+
+                guard !screenshots.isEmpty else {
+                    throw NSError(domain: "LLMService", code: 3, userInfo: [NSLocalizedDescriptionKey: "No screenshots in batch"])
+                }
+
+                await MainActor.run {
+                    progressHandler?(.transcribing)
+                }
+
+                print("📸 [LLMService] Transcribing \(screenshots.count) screenshots")
+
+                // Transcribe screenshots using provider
+                let result = try await provider.transcribeScreenshots(screenshots, batchStartTime: batchStartDate, batchId: batchId)
+                observations = result.observations
+                transcribeLog = result.log
+                print("📸 [LLMService] Transcribed → \(observations.count) observations")
                 
                 StorageManager.shared.saveObservations(batchId: batchId, observations: observations)
                 
                 // If no observations, mark batch as complete with no activities
                 guard !observations.isEmpty else {
+                    print("⚠️ [LLMService] Transcription returned 0 observations for batch \(batchId)")
+                    if let logOutput = transcribeLog.output, !logOutput.isEmpty {
+                        print("   ↳ transcribeLog.output: \(logOutput)")
+                    }
+                    if let logInput = transcribeLog.input, !logInput.isEmpty {
+                        print("   ↳ transcribeLog.input: \(logInput)")
+                    }
+                    AnalyticsService.shared.capture("transcription_returned_empty", [
+                        "batch_id": batchId,
+                        "provider": providerName(),
+                        "transcribe_latency_ms": Int((transcribeLog.latency ?? 0) * 1000)
+                    ])
                     StorageManager.shared.updateBatch(batchId, status: "analyzed")
                     completion(.success(ProcessedBatchResult(cards: [], cardIds: [])))
                     return
@@ -291,8 +221,12 @@ final class LLMService: LLMServicing {
                     categories: categories
                 )
                 
+                await MainActor.run {
+                    progressHandler?(.generatingCards)
+                }
+
                 // Generate activity cards using sliding window observations
-                let (cards, cardsLog) = try await provider.generateActivityCards(
+                let (cards, _) = try await provider.generateActivityCards(
                     observations: recentObservations,
                     context: context,
                     batchId: batchId
@@ -333,11 +267,15 @@ final class LLMService: LLMServicing {
                 // Mark batch as complete
                 StorageManager.shared.updateBatch(batchId, status: "analyzed")
 
+                // Checkpoint WAL after batch processing to ensure data is persisted
+                StorageManager.shared.checkpoint(mode: .passive)
+
                 // Track analysis batch completed
-                await AnalyticsService.shared.capture("analysis_batch_completed", [
+                AnalyticsService.shared.capture("analysis_batch_completed", [
                     "batch_id": batchId,
                     "cards_generated": cards.count,
-                    "processing_duration_seconds": Int(Date().timeIntervalSince(processingStartTime))
+                    "processing_duration_seconds": Int(Date().timeIntervalSince(processingStartTime)),
+                    "llm_provider": providerName()
                 ])
 
                 completion(.success(ProcessedBatchResult(cards: cards, cardIds: insertedCardIds)))
@@ -349,10 +287,11 @@ final class LLMService: LLMServicing {
                 }
 
                 // Track analysis batch failed
-                await AnalyticsService.shared.capture("analysis_batch_failed", [
+                AnalyticsService.shared.capture("analysis_batch_failed", [
                     "batch_id": batchId,
                     "error_message": error.localizedDescription,
-                    "processing_duration_seconds": Int(Date().timeIntervalSince(processingStartTime))
+                    "processing_duration_seconds": Int(Date().timeIntervalSince(processingStartTime)),
+                    "llm_provider": providerName()
                 ])
 
                 // Mark batch as failed
@@ -403,8 +342,9 @@ final class LLMService: LLMServicing {
     private func createErrorCard(batchId: Int64, batchStartTime: Date, batchEndTime: Date, error: Error) -> TimelineCardShell {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm a"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone.current
-        
+
         let startTimeStr = formatter.string(from: batchStartTime)
         let endTimeStr = formatter.string(from: batchEndTime)
         
@@ -476,6 +416,7 @@ final class LLMService: LLMServicing {
                 case 401: return "Unauthorized. Your Gemini API key may be invalid or expired."
                 case 403: return "Access forbidden. Check your Gemini API permissions."
                 case 429: return "Rate limited. Too many requests to Gemini. Please wait a few minutes."
+                case 503: return "Google's Gemini servers returned a 503 error. Google's AI services may be temporarily down. If you see many of these in a row, please wait at least a few hours before retrying. Check the [Google AI Studio status](https://aistudio.google.com/status) page for updates."
                 case 500...599: return "Gemini service error. The service may be temporarily down."
                 default:
                     // For other HTTP errors, provide context
@@ -523,6 +464,9 @@ final class LLMService: LLMServicing {
         case errorDescription.contains("api key") || errorDescription.contains("unauthorized") || errorDescription.contains("401"):
             return "There's an issue with your API key. Please check your settings."
             
+        case errorDescription.contains("503"):
+            return "Google's Gemini servers returned a 503 error. Google's AI services may be temporarily down. If you see many of these in a row, please wait at least a few hours before retrying. Check the [Google AI Studio status](https://aistudio.google.com/status) page for updates."
+            
         case errorDescription.contains("timeout"):
             return "The AI took too long to respond. This might be due to a long recording or slow connection."
             
@@ -548,5 +492,16 @@ final class LLMService: LLMServicing {
             // For unknown errors, keep it simple
             return "An unexpected error occurred."
         }
+    }
+
+    // MARK: - Text Generation
+
+    func generateText(prompt: String) async throws -> String {
+        guard let provider = provider else {
+            throw NSError(domain: "LLMService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No LLM provider configured. Please configure in settings."])
+        }
+
+        let (text, _) = try await provider.generateText(prompt: prompt)
+        return text
     }
 }

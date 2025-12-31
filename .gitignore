@@ -8,6 +8,8 @@ LLMEvalScript.swift
 Dayflow/eval/
 evals/
 build/
+build_tmp/
+build_universal/
 .claude/
 scripts/release.env
 signed/
@@ -15,3 +17,14 @@ signed/
 # Ignore Claude prompt notes
 CLAUDE.md
 claude.md
+
+# Tauri migration (WIP)
+dayflow-tauri/
+agents.md
+
+# Internal tools
+tools/
+
+# Eval frameworks
+claudeeval/
+codexeval/
