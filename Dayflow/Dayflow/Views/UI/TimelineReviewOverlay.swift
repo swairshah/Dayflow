@@ -704,7 +704,7 @@ struct TimelineReviewOverlay: View {
         }
     }
 
-    private static func makeRatingSummary(
+    nonisolated private static func makeRatingSummary(
         segments: [TimelineReviewRatingSegment],
         dayStartTs: Int,
         dayEndTs: Int
@@ -725,7 +725,7 @@ struct TimelineReviewOverlay: View {
         var end: Int
     }
 
-    private static func filterUnreviewedActivities(
+    nonisolated private static func filterUnreviewedActivities(
         activities: [TimelineActivity],
         ratingSegments: [TimelineReviewRatingSegment],
         dayStartTs: Int,
@@ -762,7 +762,7 @@ struct TimelineReviewOverlay: View {
         return unreviewed
     }
 
-    private static func mergedCoverageSegments(
+    nonisolated private static func mergedCoverageSegments(
         segments: [TimelineReviewRatingSegment],
         dayStartTs: Int,
         dayEndTs: Int
@@ -794,7 +794,7 @@ struct TimelineReviewOverlay: View {
         return merged
     }
 
-    private static func overlapSeconds(
+    nonisolated private static func overlapSeconds(
         start: Int,
         end: Int,
         segments: [CoverageSegment],
@@ -858,7 +858,8 @@ private struct TimelineReviewCard: View {
         self.isActive = isActive
         self.playbackToggleToken = playbackToggleToken
         self.onSummaryHover = onSummaryHover
-        _playerModel = StateObject(wrappedValue: TimelineReviewPlayerModel(videoURL: activity.videoSummaryURL))
+        let initialVideoURL = activity.videoSummaryURL
+        _playerModel = StateObject(wrappedValue: TimelineReviewPlayerModel(videoURL: initialVideoURL))
     }
 
     var body: some View {
@@ -872,7 +873,7 @@ private struct TimelineReviewCard: View {
                     player: playerModel.player,
                     onTogglePlayback: {
                         guard isActive else { return }
-                        playerModel.togglePlay()
+                        togglePlayback()
                     }
                 )
                 .frame(height: Design.mediaHeight)
@@ -957,7 +958,7 @@ private struct TimelineReviewCard: View {
         }
         .onChange(of: playbackToggleToken) { _, _ in
             guard isActive else { return }
-            playerModel.togglePlay()
+            togglePlayback()
         }
     }
 
@@ -972,8 +973,8 @@ private struct TimelineReviewCard: View {
     }
 
     private var playbackProgress: CGFloat {
-        let duration = max(playerModel.duration, 0.001)
-        let progress = playerModel.currentTime / duration
+        let duration = max(activeDuration, 0.001)
+        let progress = activeCurrentTime / duration
         return CGFloat(min(max(progress, 0), 1))
     }
 
@@ -996,7 +997,7 @@ private struct TimelineReviewCard: View {
 
     private func updateScrub(progress: CGFloat) {
         guard isActive else { return }
-        let seconds = Double(progress) * playerModel.duration
+        let seconds = Double(progress) * activeDuration
         playerModel.seek(to: seconds, resume: false)
     }
 
@@ -1006,6 +1007,18 @@ private struct TimelineReviewCard: View {
             playerModel.play()
         }
         wasPlayingBeforeScrub = false
+    }
+
+    private var activeDuration: Double {
+        playerModel.duration
+    }
+
+    private var activeCurrentTime: Double {
+        playerModel.currentTime
+    }
+
+    private func togglePlayback() {
+        playerModel.togglePlay()
     }
 
     private enum Design {
@@ -1146,12 +1159,17 @@ private final class TimelineReviewPlayerModel: ObservableObject {
 
     private func observeDuration(for item: AVPlayerItem?) {
         guard let asset = item?.asset else { return }
-        asset.loadValuesAsynchronously(forKeys: ["duration"]) { [weak self] in
-            guard let self else { return }
-            let duration = asset.duration
-            DispatchQueue.main.async {
-                let seconds = CMTimeGetSeconds(duration)
-                self.duration = seconds.isFinite && seconds > 0 ? seconds : 1
+        Task {
+            do {
+                let duration = try await asset.load(.duration)
+                await MainActor.run {
+                    let seconds = CMTimeGetSeconds(duration)
+                    self.duration = seconds.isFinite && seconds > 0 ? seconds : 1
+                }
+            } catch {
+                await MainActor.run {
+                    self.duration = 1
+                }
             }
         }
     }
@@ -1920,7 +1938,8 @@ private func makeTimelineActivities(from cards: [TimelineCard], for date: Date) 
             distractions: card.distractions,
             videoSummaryURL: card.videoSummaryURL,
             screenshot: nil,
-            appSites: card.appSites
+            appSites: card.appSites,
+            isBackupGenerated: card.isBackupGenerated
         ))
     }
 

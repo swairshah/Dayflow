@@ -124,7 +124,7 @@ final class AnalysisManager: AnalysisManaging {
                     progressHandler("Processing batch \(index + 1) of \(batchIds.count)... (Total elapsed: \(self.formatDuration(elapsedTotal)))")
                 }
 
-                self.queueGeminiRequest(batchId: batchId)
+                self.queueLLMRequest(batchId: batchId)
 
                 // Wait for batch to complete (check status periodically)
                 var isCompleted = false
@@ -236,7 +236,7 @@ final class AnalysisManager: AnalysisManaging {
                     progressHandler("Processing batch \(index + 1) of \(batchesToProcess.count)... (Total elapsed: \(self.formatDuration(elapsedTotal)))")
                 }
 
-                self.queueGeminiRequest(batchId: batchId)
+                self.queueLLMRequest(batchId: batchId)
 
                 // Wait for batch to complete (check status periodically)
                 var isCompleted = false
@@ -310,7 +310,7 @@ final class AnalysisManager: AnalysisManaging {
                 return
             }
 
-            self.queueGeminiRequest(
+            self.queueLLMRequest(
                 batchId: batchId,
                 progressHandler: stepHandler,
                 completion: { result in
@@ -336,11 +336,11 @@ final class AnalysisManager: AnalysisManaging {
         // 3. Persist batch rows & join table
         let batchIDs = batches.compactMap(saveScreenshotBatch)
         // 4. Fire LLM for each batch
-        for id in batchIDs { queueGeminiRequest(batchId: id) }
+        for id in batchIDs { queueLLMRequest(batchId: id) }
     }
 
 
-    private func queueGeminiRequest(
+    private func queueLLMRequest(
         batchId: Int64,
         progressHandler: ((LLMProcessingStep) -> Void)? = nil,
         completion: ((Result<Void, Error>) -> Void)? = nil
@@ -596,43 +596,6 @@ final class AnalysisManager: AnalysisManaging {
     private func saveScreenshotBatch(_ batch: ScreenshotBatch) -> Int64? {
         let ids = batch.screenshots.map { $0.id }
         return store.saveBatchWithScreenshots(startTs: batch.start, endTs: batch.end, screenshotIds: ids)
-    }
-
-    // Parses a video timestamp like "05:30" into seconds
-    private func parseVideoTimestamp(_ timestamp: String) -> TimeInterval? {
-        let components = timestamp.components(separatedBy: ":")
-        guard components.count == 2,
-              let minutes = Int(components[0]),
-              let seconds = Int(components[1]) else {
-            return nil
-        }
-
-        return TimeInterval(minutes * 60 + seconds)
-    }
-
-    // Formats a Date as a clock time like "11:37 AM"
-    private func formatAsClockTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a" // e.g., "11:37 AM"
-        formatter.timeZone = TimeZone.current
-        return formatter.string(from: date)
-    }
-
-    // Parses a clock time like "11:37 AM" to a Date
-    private func parseClockTime(_ timeString: String, baseDate: Date) -> Date? {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "h:mm a"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-
-        guard let time = formatter.date(from: timeString) else { return nil }
-
-        let calendar = Calendar.current
-        let timeComponents = calendar.dateComponents([.hour, .minute], from: time)
-
-        return calendar.date(bySettingHour: timeComponents.hour ?? 0,
-                           minute: timeComponents.minute ?? 0,
-                           second: 0,
-                           of: baseDate)
     }
 
     // Formats a duration in seconds to a human-readable string

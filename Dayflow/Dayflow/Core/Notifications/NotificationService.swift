@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 import AppKit
 
 @MainActor
@@ -98,12 +98,13 @@ final class NotificationService: NSObject, ObservableObject {
 
     /// Cancel all journal reminder notifications
     func cancelAllReminders() {
+        let center = self.center  // Capture locally while on MainActor
         center.getPendingNotificationRequests { requests in
             let journalIds = requests
                 .filter { $0.identifier.hasPrefix("journal.") }
                 .map { $0.identifier }
 
-            self.center.removePendingNotificationRequests(withIdentifiers: journalIds)
+            center.removePendingNotificationRequests(withIdentifiers: journalIds)
             print("[NotificationService] Cancelled \(journalIds.count) pending notifications")
         }
     }
@@ -180,7 +181,9 @@ extension NotificationService: UNUserNotificationCenterDelegate {
 
             // Activate app and bring to foreground
             NSApp.activate(ignoringOtherApps: true)
-            if NSApp.activationPolicy() == .accessory {
+            // Only show Dock icon if user preference allows it
+            let showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? true
+            if showDockIcon && NSApp.activationPolicy() == .accessory {
                 NSApp.setActivationPolicy(.regular)
             }
             NSApp.windows.first?.makeKeyAndOrderFront(nil)

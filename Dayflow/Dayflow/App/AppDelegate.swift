@@ -28,6 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingRecordingAnalyticsReason: String?
     private var heartbeatTimer: Timer?
     private var appLaunchDate: Date?
+    private var foregroundStartTime: Date?
 
     override init() {
         UserDefaultsMigrator.migrateIfNeeded()
@@ -129,7 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     print("Screen recording permission not granted, skipping auto-start")
                 }
-                await self.flushPendingDeepLinks()
+                self.flushPendingDeepLinks()
             }
         } else {
             // Still in early onboarding, don't enable persistence yet
@@ -164,9 +165,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil,
             queue: .main
         ) { _ in
-            AppDelegate.allowTermination = true
+            MainActor.assumeIsolated {
+                AppDelegate.allowTermination = true
+            }
         }
 
+        // Track foreground sessions for engagement analytics
+        setupForegroundTracking()
     }
     
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -179,6 +184,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateCancel
     }
     
+    // MARK: - Foreground Tracking
+
+    private func setupForegroundTracking() {
+        // Initialize with current state (app is active at launch)
+        foregroundStartTime = Date()
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.foregroundStartTime = Date()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let startTime = self.foregroundStartTime else { return }
+                let duration = Date().timeIntervalSince(startTime)
+                self.foregroundStartTime = nil
+
+                AnalyticsService.shared.capture("app_foreground_session", [
+                    "duration_seconds": round(duration * 10) / 10  // 1 decimal place
+                ])
+            }
+        }
+    }
+
     // Start Gemini analysis as a background task
     private func setupGeminiAnalysis() {
         // Perform after a short delay to ensure other initialization completes
@@ -263,7 +301,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Schedule repeating timer every 12 hours
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: 12 * 60 * 60, repeats: true) { [weak self] _ in
-            self?.sendHeartbeat()
+            MainActor.assumeIsolated {
+                self?.sendHeartbeat()
+            }
         }
     }
 

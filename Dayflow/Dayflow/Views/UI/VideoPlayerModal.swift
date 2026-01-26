@@ -9,6 +9,12 @@ import SwiftUI
 import AVKit
 import AppKit
 
+private let videoPlayerTimeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "h:mm a"
+    return formatter
+}()
+
 // MARK: - Hero Animation State (Emil Kowalski: shared element transitions)
 
 /// Manages the hero animation state for video thumbnail-to-modal expansion
@@ -21,6 +27,7 @@ final class VideoExpansionState: ObservableObject {
     @Published var thumbnailFrame: CGRect = .zero
     @Published var containerSize: CGSize = .zero
     @Published var isHoveringVideo: Bool = false
+    @Published var heroId: String = ""
 
     // Animation phase tracking for choreographed entrance
     @Published var animationPhase: AnimationPhase = .collapsed
@@ -47,6 +54,7 @@ final class VideoExpansionState: ObservableObject {
         self.endTime = endTime
         self.thumbnailFrame = thumbnailFrame
         self.containerSize = containerSize
+        self.heroId = "heroVideo_\(videoURL)"
 
         // Immediate expansion with spring animation - no delays
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -63,6 +71,7 @@ final class VideoExpansionState: ObservableObject {
         self.title = nil
         self.startTime = nil
         self.endTime = nil
+        self.heroId = ""
     }
 }
 
@@ -94,7 +103,7 @@ struct VideoExpansionOverlay: View {
                 modalContent
             }
             .onAppear {
-                setupPlayer()
+                setupPlayback()
                 setupKeyMonitor()
                 AnalyticsService.shared.capture("video_modal_opened", [
                     "source": expansionState.title != nil ? "hero_animation" : "unknown",
@@ -102,7 +111,7 @@ struct VideoExpansionOverlay: View {
                 ])
             }
             .onDisappear {
-                cleanupPlayer()
+                cleanupPlayback()
                 removeKeyMonitor()
             }
         }
@@ -122,6 +131,7 @@ struct VideoExpansionOverlay: View {
     private var modalContent: some View {
         let targetWidth = (expansionState.containerSize.width) * 0.9
         let targetHeight = (expansionState.containerSize.height) * 0.9
+        let matchedId = expansionState.heroId.isEmpty ? "heroVideo_\(expansionState.videoURL)" : expansionState.heroId
 
         VStack(spacing: 0) {
             // Header (fades in during expansion)
@@ -133,7 +143,7 @@ struct VideoExpansionOverlay: View {
 
             // Video area with matched geometry
             GeometryReader { geo in
-                let a = max(0.1, viewModel.videoAspect)
+                let a = max(0.1, activeAspectRatio)
                 let h = geo.size.height
                 let wFitHeight = h * a
                 let fitsWidth = wFitHeight <= geo.size.width
@@ -148,10 +158,10 @@ struct VideoExpansionOverlay: View {
                         Spacer(minLength: 0)
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture { viewModel.togglePlayPause() }
+                    .onTapGesture { togglePlayback() }
                 }
             }
-            .matchedGeometryEffect(id: "heroVideo_\(expansionState.videoURL)", in: namespace)
+            .matchedGeometryEffect(id: matchedId, in: namespace)
 
             // Scrubber (slides up during expansion)
             scrubberView
@@ -176,7 +186,7 @@ struct VideoExpansionOverlay: View {
                         .fontWeight(.semibold)
                 }
                 if let startTime = expansionState.startTime, let endTime = expansionState.endTime {
-                    Text("\(timeFormatter.string(from: startTime)) to \(timeFormatter.string(from: endTime))")
+                    Text("\(videoPlayerTimeFormatter.string(from: startTime)) to \(videoPlayerTimeFormatter.string(from: endTime))")
                         .font(.caption)
                         .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.4))
                 }
@@ -308,7 +318,16 @@ struct VideoExpansionOverlay: View {
     }
 
     // Player setup
-    private func setupPlayer() {
+    private var activeAspectRatio: CGFloat {
+        viewModel.videoAspect
+    }
+
+    private var scrubberURL: URL? {
+        let processedURL = expansionState.videoURL.hasPrefix("file://") ? expansionState.videoURL : "file://" + expansionState.videoURL
+        return URL(string: processedURL)
+    }
+
+    private func setupPlayback() {
         let processedURL = expansionState.videoURL.hasPrefix("file://") ? expansionState.videoURL : "file://" + expansionState.videoURL
         guard let url = URL(string: processedURL) else { return }
         if url.isFileURL {
@@ -318,12 +337,7 @@ struct VideoExpansionOverlay: View {
         viewModel.setupPlayer(url: url)
     }
 
-    private var scrubberURL: URL? {
-        let processedURL = expansionState.videoURL.hasPrefix("file://") ? expansionState.videoURL : "file://" + expansionState.videoURL
-        return URL(string: processedURL)
-    }
-
-    private func cleanupPlayer() {
+    private func cleanupPlayback() {
         viewModel.cleanup()
     }
 
@@ -337,7 +351,7 @@ struct VideoExpansionOverlay: View {
 
             // Space to toggle play/pause
             if event.keyCode == 49 && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
-                viewModel.togglePlayPause()
+                togglePlayback()
                 return nil
             }
 
@@ -362,11 +376,10 @@ struct VideoExpansionOverlay: View {
         expansionState.collapse()
     }
 
-    private var timeFormatter: DateFormatter {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f
+    private func togglePlayback() {
+        viewModel.togglePlayPause()
     }
+
 }
 
 struct ScaleButtonStyle: ButtonStyle {
@@ -442,26 +455,39 @@ class VideoPlayerViewModel: ObservableObject {
     
     func setupPlayer(url: URL) {
         player = AVPlayer(url: url)
-        
+
         // Get video duration and aspect
-        player?.currentItem?.asset.loadValuesAsynchronously(forKeys: ["duration", "tracks"]) { [weak self] in
-            guard let asset = self?.player?.currentItem?.asset else { return }
-            let duration = asset.duration
-            DispatchQueue.main.async {
-                self?.duration = CMTimeGetSeconds(duration)
-                if let track = asset.tracks(withMediaType: .video).first {
-                    let natural = track.naturalSize
-                    let transform = track.preferredTransform
+        guard let asset = player?.currentItem?.asset else { return }
+        Task {
+            do {
+                let duration = try await asset.load(.duration)
+                let tracks = try await asset.loadTracks(withMediaType: .video)
+
+                var aspect: CGFloat = 16.0 / 9.0  // Default aspect ratio
+                if let track = tracks.first {
+                    let natural = try await track.load(.naturalSize)
+                    let transform = try await track.load(.preferredTransform)
                     let transformed = natural.applying(transform)
                     let w = abs(transformed.width) > 0 ? abs(transformed.width) : max(1, natural.width)
                     let h = abs(transformed.height) > 0 ? abs(transformed.height) : max(1, natural.height)
-                    let aspect = max(0.1, CGFloat(w / h))
-                    self?.videoAspect = aspect
+                    aspect = max(0.1, CGFloat(w / h))
                 }
-                self?.loadSegments()
+
+                // Shadow mutable var with let before crossing async boundary
+                let finalAspect = aspect
+
+                await MainActor.run {
+                    self.duration = CMTimeGetSeconds(duration)
+                    self.videoAspect = finalAspect
+                    self.loadSegments()
+                }
+            } catch {
+                await MainActor.run {
+                    self.loadSegments()
+                }
             }
         }
-        
+
         // Observe playback time
         let interval = CMTime(seconds: 1.0/60.0, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
         timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
@@ -559,7 +585,7 @@ struct VideoPlayerModal: View {
                                 .fontWeight(.semibold)
                         }
                         if let startTime = startTime, let endTime = endTime {
-                            Text("\(timeFormatter.string(from: startTime)) to \(timeFormatter.string(from: endTime))")
+                            Text("\(videoPlayerTimeFormatter.string(from: startTime)) to \(videoPlayerTimeFormatter.string(from: endTime))")
                                 .font(.caption)
                                 .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.4))
                         }
@@ -780,16 +806,7 @@ struct VideoPlayerModal: View {
         }
     }
     
-    private func showControlsTemporarily() {
-        showControls = true
-        startControlsTimer()
-    }
 }
 
 extension VideoPlayerModal {
-    private var timeFormatter: DateFormatter {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f
-    }
 }

@@ -22,12 +22,26 @@ enum LLMProcessingStep: Sendable, Equatable {
 protocol LLMServicing {
     func processBatch(_ batchId: Int64, progressHandler: ((LLMProcessingStep) -> Void)?, completion: @escaping (Result<ProcessedBatchResult, Error>) -> Void)
     func generateText(prompt: String) async throws -> String
+    func generateTextStreaming(prompt: String) -> AsyncThrowingStream<String, Error>
+    /// Rich chat streaming with thinking, tool calls, and text events (ChatCLI only)
+    /// - Parameter sessionId: Optional session ID to resume a previous conversation
+    func generateChatStreaming(prompt: String, sessionId: String?) -> AsyncThrowingStream<ChatStreamEvent, Error>
     var batchingConfig: BatchingConfig { get }
 }
 
 final class LLMService: LLMServicing {
     static let shared: LLMServicing = LLMService()
     
+    private struct BatchProviderActions {
+        let transcribeScreenshots: ([Screenshot], Date, Int64?) async throws -> (observations: [Observation], log: LLMCall)
+        let generateActivityCards: ([Observation], ActivityGenerationContext, Int64?) async throws -> (cards: [ActivityCardData], log: LLMCall)
+    }
+
+    private struct TextProviderActions {
+        let generateText: (String) async throws -> (text: String, log: LLMCall)
+        let generateTextStreaming: ((String) -> AsyncThrowingStream<String, Error>)?
+    }
+
     private var providerType: LLMProviderType {
         guard let savedData = UserDefaults.standard.data(forKey: "llmProviderType") else {
             return .geminiDirect
@@ -41,28 +55,7 @@ final class LLMService: LLMServicing {
         }
     }
     
-    private var provider: LLMProvider? {
-        switch providerType {
-        case .geminiDirect:
-            return makeGeminiProvider()
-        case .dayflowBackend(let endpoint):
-            if let token = KeychainManager.shared.retrieve(for: "dayflow"), !token.isEmpty {
-                return DayflowBackendProvider(token: token, endpoint: endpoint)
-            } else {
-                print("❌ [LLMService] Failed to retrieve Dayflow token from Keychain")
-                return nil
-            }
-
-        case .ollamaLocal(let endpoint):
-            return OllamaProvider(endpoint: endpoint)
-        case .chatGPTClaude:
-            let preferredTool = UserDefaults.standard.string(forKey: "chatCLIPreferredTool") ?? "codex"
-            let tool: ChatCLITool = (preferredTool == "claude") ? .claude : .codex
-            return ChatCLIProvider(tool: tool)
-        }
-    }
-    
-    private func makeGeminiProvider() -> LLMProvider? {
+    private func makeGeminiProvider() -> GeminiDirectProvider? {
         if let apiKey = KeychainManager.shared.retrieve(for: "gemini"), !apiKey.isEmpty {
             let preference = GeminiModelPreference.load()
             return GeminiDirectProvider(apiKey: apiKey, preference: preference)
@@ -72,12 +65,173 @@ final class LLMService: LLMServicing {
         }
     }
 
+    private func makeGemmaBackupProvider() -> GemmaBackupProvider? {
+        if let apiKey = KeychainManager.shared.retrieve(for: "gemini"), !apiKey.isEmpty {
+            return GemmaBackupProvider(apiKey: apiKey)
+        }
+        print("❌ [LLMService] Failed to retrieve Gemini API key for Gemma fallback")
+        return nil
+    }
+
+    private func makeDayflowProvider(endpoint: String) -> DayflowBackendProvider? {
+        if let token = KeychainManager.shared.retrieve(for: "dayflow"), !token.isEmpty {
+            return DayflowBackendProvider(token: token, endpoint: endpoint)
+        }
+        print("❌ [LLMService] Failed to retrieve Dayflow token from Keychain")
+        return nil
+    }
+
+    private func makeOllamaProvider(endpoint: String) -> OllamaProvider {
+        OllamaProvider(endpoint: endpoint)
+    }
+
+    private func makeChatCLIProvider() -> ChatCLIProvider {
+        let preferredTool = UserDefaults.standard.string(forKey: "chatCLIPreferredTool") ?? "codex"
+        let tool: ChatCLITool = (preferredTool == "claude") ? .claude : .codex
+        return ChatCLIProvider(tool: tool)
+    }
+
     private func providerName() -> String {
         switch providerType {
         case .geminiDirect: return "gemini"
         case .dayflowBackend: return "dayflow"
         case .ollamaLocal: return "ollama"
         case .chatGPTClaude: return "chat_cli"
+        }
+    }
+
+    private func noProviderError() -> NSError {
+        NSError(
+            domain: "LLMService",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "No LLM provider configured. Please configure in settings."]
+        )
+    }
+
+    private func makeBatchProvider() throws -> (actions: BatchProviderActions, fallbackState: GemmaFallbackState?) {
+        switch providerType {
+        case .geminiDirect:
+            guard let provider = makeGeminiProvider() else { throw noProviderError() }
+            let gemmaProvider = makeGemmaBackupProvider()
+            let fallbackState = GemmaFallbackState()
+
+            return (actions: BatchProviderActions(
+                transcribeScreenshots: { [weak self] screenshots, batchStartTime, batchId in
+                    if fallbackState.preferGemma, let gemmaProvider {
+                        return try await gemmaProvider.transcribeScreenshots(screenshots, batchStartTime: batchStartTime, batchId: batchId)
+                    }
+
+                    do {
+                        return try await provider.transcribeScreenshots(screenshots, batchStartTime: batchStartTime, batchId: batchId)
+                    } catch {
+                        guard let gemmaProvider else { throw error }
+                        fallbackState.preferGemma = true
+                        self?.logGemmaFallback(operation: "transcribe", error: error, batchId: batchId)
+                        return try await gemmaProvider.transcribeScreenshots(screenshots, batchStartTime: batchStartTime, batchId: batchId)
+                    }
+                },
+                generateActivityCards: { [weak self] observations, context, batchId in
+                    if fallbackState.preferGemma, let gemmaProvider {
+                        fallbackState.usedGemmaForCardGeneration = true
+                        return try await gemmaProvider.generateActivityCards(observations: observations, context: context, batchId: batchId)
+                    }
+
+                    do {
+                        return try await provider.generateActivityCards(observations: observations, context: context, batchId: batchId)
+                    } catch {
+                        guard let gemmaProvider else { throw error }
+                        fallbackState.preferGemma = true
+                        fallbackState.usedGemmaForCardGeneration = true
+                        self?.logGemmaFallback(operation: "generate_cards", error: error, batchId: batchId)
+                        return try await gemmaProvider.generateActivityCards(observations: observations, context: context, batchId: batchId)
+                    }
+                }
+            ), fallbackState: fallbackState)
+        case .dayflowBackend(let endpoint):
+            guard let provider = makeDayflowProvider(endpoint: endpoint) else { throw noProviderError() }
+            return (actions: BatchProviderActions(
+                transcribeScreenshots: provider.transcribeScreenshots,
+                generateActivityCards: provider.generateActivityCards
+            ), fallbackState: nil)
+        case .ollamaLocal(let endpoint):
+            let provider = makeOllamaProvider(endpoint: endpoint)
+            return (actions: BatchProviderActions(
+                transcribeScreenshots: provider.transcribeScreenshots,
+                generateActivityCards: provider.generateActivityCards
+            ), fallbackState: nil)
+        case .chatGPTClaude:
+            let provider = makeChatCLIProvider()
+            return (actions: BatchProviderActions(
+                transcribeScreenshots: provider.transcribeScreenshots,
+                generateActivityCards: provider.generateActivityCards
+            ), fallbackState: nil)
+        }
+    }
+
+    private final class GemmaFallbackState {
+        var preferGemma = false
+        var usedGemmaForCardGeneration = false
+    }
+
+    private func logGemmaFallback(operation: String, error: Error, batchId: Int64?) {
+        let nsError = error as NSError
+        AnalyticsService.shared.capture("llm_fallback_used", [
+            "provider": "gemini",
+            "fallback_provider": "gemma",
+            "operation": operation,
+            "error_domain": nsError.domain,
+            "error_code": nsError.code,
+            "error_message": nsError.localizedDescription,
+            "batch_id": batchId as Any
+        ])
+    }
+
+    private func makeTextProvider() throws -> TextProviderActions {
+        switch providerType {
+        case .geminiDirect:
+            guard let provider = makeGeminiProvider() else { throw noProviderError() }
+            return TextProviderActions(
+                generateText: provider.generateText,
+                generateTextStreaming: nil
+            )
+        case .dayflowBackend(let endpoint):
+            guard let provider = makeDayflowProvider(endpoint: endpoint) else { throw noProviderError() }
+            return TextProviderActions(
+                generateText: provider.generateText,
+                generateTextStreaming: nil
+            )
+        case .ollamaLocal(let endpoint):
+            let provider = makeOllamaProvider(endpoint: endpoint)
+            return TextProviderActions(
+                generateText: provider.generateText,
+                generateTextStreaming: nil
+            )
+        case .chatGPTClaude:
+            let provider = makeChatCLIProvider()
+            return TextProviderActions(
+                generateText: provider.generateText,
+                generateTextStreaming: provider.generateTextStreaming
+            )
+        }
+    }
+
+    private func makeFallbackTextStream(_ work: @escaping () async throws -> String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let text = try await work()
+                    continuation.yield(text)
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func makeErrorStream(_ error: Error) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish(throwing: error)
         }
     }
 
@@ -113,11 +267,10 @@ final class LLMService: LLMServicing {
                     "total_duration_seconds": batchEndTs - batchStartTs,
                     "llm_provider": providerName()
                 ])
-                
-                // Check provider inside the do block so errors go through catch
-                guard let provider = provider else {
-                    throw NSError(domain: "LLMService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No LLM provider configured. Please configure in settings."])
-                }
+
+                let providerBundle = try makeBatchProvider()
+                let batchProvider = providerBundle.actions
+                let fallbackState = providerBundle.fallbackState
                 
                 // Mark batch as processing
                 StorageManager.shared.updateBatch(batchId, status: "processing")
@@ -141,7 +294,7 @@ final class LLMService: LLMServicing {
                 print("📸 [LLMService] Transcribing \(screenshots.count) screenshots")
 
                 // Transcribe screenshots using provider
-                let result = try await provider.transcribeScreenshots(screenshots, batchStartTime: batchStartDate, batchId: batchId)
+                let result = try await batchProvider.transcribeScreenshots(screenshots, batchStartDate, batchId)
                 observations = result.observations
                 transcribeLog = result.log
                 print("📸 [LLMService] Transcribed → \(observations.count) observations")
@@ -169,13 +322,13 @@ final class LLMService: LLMServicing {
                 
                 // SLIDING WINDOW CARD GENERATION - Replace old card generation with sliding window approach
                 
-                // Calculate time window (1 hour before current batch end time)
+                // Calculate time window (30 minutes before current batch end time)
                 let currentTime = Date(timeIntervalSince1970: TimeInterval(batchEndTs))
-                let oneHourAgo = currentTime.addingTimeInterval(-3600) // 1 hour = 3600 seconds
+                let thirtyMinutesAgo = currentTime.addingTimeInterval(-1800) // 30 minutes = 1800 seconds
                 
-                // Fetch all observations from the last hour (instead of just current batch)
+                // Fetch all observations from the last 30 minutes (instead of just current batch)
                 let recentObservations = StorageManager.shared.fetchObservationsByTimeRange(
-                    from: oneHourAgo,
+                    from: thirtyMinutesAgo,
                     to: currentTime
                 )
 
@@ -185,9 +338,9 @@ final class LLMService: LLMServicing {
                     print("       observation: \(obs.observation)")
                 }
                 
-                // Fetch existing timeline cards that overlap with the last hour
+                // Fetch existing timeline cards that overlap with the last 30 minutes
                 let existingTimelineCards = StorageManager.shared.fetchTimelineCardsByTimeRange(
-                    from: oneHourAgo,
+                    from: thirtyMinutesAgo,
                     to: currentTime
                 )
                 
@@ -226,16 +379,13 @@ final class LLMService: LLMServicing {
                 }
 
                 // Generate activity cards using sliding window observations
-                let (cards, _) = try await provider.generateActivityCards(
-                    observations: recentObservations,
-                    context: context,
-                    batchId: batchId
-                )
+                let (cards, _) = try await batchProvider.generateActivityCards(recentObservations, context, batchId)
+                let isBackupGenerated = fallbackState?.usedGemmaForCardGeneration == true
                 // Note: card generation log is not persisted per-batch yet
                 
                 // Replace old cards with new ones in the time range
                 let (insertedCardIds, deletedVideoPaths) = StorageManager.shared.replaceTimelineCardsInRange(
-                    from: oneHourAgo,
+                    from: thirtyMinutesAgo,
                     to: currentTime,
                     with: cards.map { card in
                         TimelineCardShell(
@@ -247,7 +397,8 @@ final class LLMService: LLMServicing {
                             summary: card.summary,
                             detailedSummary: card.detailedSummary,
                             distractions: card.distractions,
-                            appSites: card.appSites
+                            appSites: card.appSites,
+                            isBackupGenerated: isBackupGenerated ? true : nil
                         )
                     },
                     batchId: batchId
@@ -497,11 +648,50 @@ final class LLMService: LLMServicing {
     // MARK: - Text Generation
 
     func generateText(prompt: String) async throws -> String {
-        guard let provider = provider else {
-            throw NSError(domain: "LLMService", code: 1, userInfo: [NSLocalizedDescriptionKey: "No LLM provider configured. Please configure in settings."])
+        let textProvider = try makeTextProvider()
+        let (text, _) = try await textProvider.generateText(prompt)
+        return text
+    }
+
+    // MARK: - Streaming Text Generation
+
+    func generateTextStreaming(prompt: String) -> AsyncThrowingStream<String, Error> {
+        do {
+            let textProvider = try makeTextProvider()
+            if let streaming = textProvider.generateTextStreaming {
+                return streaming(prompt)
+            }
+            return makeFallbackTextStream { try await textProvider.generateText(prompt).text }
+        } catch {
+            return makeErrorStream(error)
+        }
+    }
+
+    // MARK: - Rich Chat Streaming (ChatCLI only)
+
+    func generateChatStreaming(prompt: String, sessionId: String? = nil) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        // For ChatCLI, use the rich streaming API with session support
+        if case .chatGPTClaude = providerType {
+            let chatCLI = makeChatCLIProvider()
+            return chatCLI.generateChatStreaming(prompt: prompt, sessionId: sessionId)
         }
 
-        let (text, _) = try await provider.generateText(prompt: prompt)
-        return text
+        let stream = generateTextStreaming(prompt: prompt)
+        return AsyncThrowingStream { continuation in
+            Task {
+                var accumulatedText = ""
+                do {
+                    for try await chunk in stream {
+                        accumulatedText += chunk
+                        continuation.yield(.textDelta(chunk))
+                    }
+                    continuation.yield(.complete(text: accumulatedText))
+                    continuation.finish()
+                } catch {
+                    continuation.yield(.error(error.localizedDescription))
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 }

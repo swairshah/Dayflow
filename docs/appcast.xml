@@ -4,6 +4,66 @@
     <title>Dayflow Updates</title>
     <language>en</language>
     <item>
+      <title>Version 1.6.2</title>
+      <pubDate>Mon, 26 Jan 2026 20:16:57 +0000</pubDate>
+      <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.6.2/Dayflow.dmg"
+                 sparkle:version="86"
+                 sparkle:shortVersionString="1.6.2"
+                 length="36546576"
+                 type="application/octet-stream"
+                 sparkle:edSignature="Rcx5xQHlW7rpZOhB3+A5Z6Z3gtq/7gWA2XuIuBaF8in4Vjzh+4Z3KwOml8vA9laaG3woMU+EcV+Gs/t6FtFOAA=="/>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <releaseNotesLink>https://github.com/JerryZLiu/Dayflow/releases/tag/v1.6.2</releaseNotesLink>
+    </item>
+    <item>
+      <title>Version 1.6.1</title>
+      <pubDate>Mon, 26 Jan 2026 05:12:15 +0000</pubDate>
+      <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.6.1/Dayflow.dmg"
+                 sparkle:version="85"
+                 sparkle:shortVersionString="1.6.1"
+                 length="36546513"
+                 type="application/octet-stream"
+                 sparkle:edSignature="HY24gdjP9fYTrTnD1qekQOZDvL07x6679UM/8X/0r3RMRDCLpouqZUmlIZNfGFt1BK8XxunkP6nn9dnsK9FkDQ=="/>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <releaseNotesLink>https://github.com/JerryZLiu/Dayflow/releases/tag/v1.6.1</releaseNotesLink>
+    </item>
+    <item>
+      <title>Version 1.6.0</title>
+      <pubDate>Sat, 24 Jan 2026 19:26:25 +0000</pubDate>
+      <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.6.0/Dayflow.dmg"
+                 sparkle:version="84"
+                 sparkle:shortVersionString="1.6.0"
+                 length="36545419"
+                 type="application/octet-stream"
+                 sparkle:edSignature="+9N1Z2ozHFn8R06M6D1csCFw/cTWt9QovchHIF+/yHytkVtxDKY49p19D1AoMcF/LwxgOJPEvqY3ZLqZe4o6CA=="/>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <releaseNotesLink>https://github.com/JerryZLiu/Dayflow/releases/tag/v1.6.0</releaseNotesLink>
+    </item>
+    <item>
+      <title>Version 1.5.4</title>
+      <pubDate>Thu, 08 Jan 2026 14:09:19 +0000</pubDate>
+      <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.5.4/Dayflow.dmg"
+                 sparkle:version="83"
+                 sparkle:shortVersionString="1.5.4"
+                 length="37873746"
+                 type="application/octet-stream"
+                 sparkle:edSignature="Z7yoPTlW1Nc2SppJVUIz7Hj28BVzX4dVg0/bzKLZAIK0MkMY7Dd/u1ZHskKKqW3z33SOPYH8odtNHbcMNXr7Aw=="/>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <releaseNotesLink>https://github.com/JerryZLiu/Dayflow/releases/tag/v1.5.4</releaseNotesLink>
+    </item>
+    <item>
+      <title>Version 1.5.3</title>
+      <pubDate>Mon, 05 Jan 2026 05:04:01 +0000</pubDate>
+      <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.5.3/Dayflow.dmg"
+                 sparkle:version="82"
+                 sparkle:shortVersionString="1.5.3"
+                 length="37868511"
+                 type="application/octet-stream"
+                 sparkle:edSignature="uv3+b4F7ZzUVm/pxqUM/2RdF6OHxO2nckrxfC1S3rwQs4YGJeN5RspYUNuS83WUCvNDU619+EdES9kBsFdWNCA=="/>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <releaseNotesLink>https://github.com/JerryZLiu/Dayflow/releases/tag/v1.5.3</releaseNotesLink>
+    </item>
+    <item>
       <title>Version 1.5.2</title>
       <pubDate>Sun, 28 Dec 2025 12:06:04 +0000</pubDate>
       <enclosure url="https://github.com/JerryZLiu/Dayflow/releases/download/v1.5.2/Dayflow.dmg"

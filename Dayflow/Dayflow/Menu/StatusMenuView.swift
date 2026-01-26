@@ -4,7 +4,6 @@ import AppKit
 @MainActor
 struct StatusMenuView: View {
     let dismissMenu: () -> Void
-    @ObservedObject private var appState = AppState.shared
     @ObservedObject private var pauseManager = PauseManager.shared
     private let updaterManager = UpdaterManager.shared
 
@@ -20,8 +19,8 @@ struct StatusMenuView: View {
             MenuDivider()
 
             MenuRow(title: "Open Dayflow", systemImage: "macwindow", action: openDayflow)
-            MenuRow(title: "Open Recordings", systemImage: "folder", action: openRecordingsFolder)
-            MenuRow(title: "Check for Updates", systemImage: "arrow.triangle.2.circlepath", action: checkForUpdates)
+            MenuRow(title: "Open Recordings", action: openRecordingsFolder)
+            MenuRow(title: "Check for Updates", action: checkForUpdates)
 
             MenuDivider()
 
@@ -46,7 +45,11 @@ struct StatusMenuView: View {
         let menuWindowNumber = NSApp.keyWindow?.windowNumber
 
         performAfterMenuDismiss {
-            NSApp.setActivationPolicy(.regular)
+            // Only show Dock icon if user preference allows it
+            let showDockIcon = UserDefaults.standard.object(forKey: "showDockIcon") as? Bool ?? true
+            if showDockIcon {
+                NSApp.setActivationPolicy(.regular)
+            }
             NSApp.unhide(nil)
             NSApp.activate(ignoringOtherApps: true)
 
@@ -235,7 +238,7 @@ private struct CountdownBadge: View {
 
 private struct MenuRow: View {
     let title: String
-    let systemImage: String
+    var systemImage: String? = nil
     var accent: Color = .primary
     var keepsMenuOpen: Bool = false
     var action: () -> Void
@@ -245,10 +248,15 @@ private struct MenuRow: View {
     var body: some View {
         Button(action: handleTap) {
             HStack(spacing: 7) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(accent)
-                    .frame(width: 17)
+                if let systemImage {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(accent)
+                        .frame(width: 17)
+                } else {
+                    // Empty spacer to align text with rows that have icons
+                    Color.clear.frame(width: 17)
+                }
 
                 Text(title)
                     .font(.system(size: 12, weight: .semibold))

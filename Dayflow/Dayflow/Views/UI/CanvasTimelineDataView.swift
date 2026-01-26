@@ -66,7 +66,6 @@ struct CanvasTimelineDataView: View {
     @State private var loadTask: Task<Void, Never>?
     // Staggered entrance animation state (Emil Kowalski principle: sequential reveal)
     @State private var cardEntranceProgress: [String: Bool] = [:]
-    @State private var entranceAnimationTrigger: Int = 0
     @EnvironmentObject private var categoryStore: CategoryStore
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var retryCoordinator: RetryCoordinator
@@ -243,6 +242,7 @@ struct CanvasTimelineDataView: View {
                     isSelected: selectedCardId == item.id,
                     isSystemCategory: item.categoryName.trimmingCharacters(in: .whitespacesAndNewlines)
                         .caseInsensitiveCompare("System") == .orderedSame,
+                    isBackupGenerated: item.activity.isBackupGenerated == true,
                     onTap: {
                         if selectedCardId == item.id {
                             selectedCardId = nil
@@ -315,14 +315,18 @@ struct CanvasTimelineDataView: View {
                             .scaleEffect(isBreathing ? 1.1 : 1.0)
                     }
                     .animation(
-                        .easeInOut(duration: 1.5)
-                        .repeatForever(autoreverses: true),
+                        isBreathing
+                            ? .easeInOut(duration: 1.5).repeatForever(autoreverses: true)
+                            : .easeInOut(duration: 0.3),
                         value: isBreathing
                     )
                 }
                 .frame(height: 1)
                 .onAppear {
-                    isBreathing = appState.isRecording
+                    // Delay setting isBreathing to allow the view to settle first
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        isBreathing = appState.isRecording
+                    }
                 }
                 .onChange(of: appState.isRecording) { _, newValue in
                     isBreathing = newValue
@@ -363,8 +367,8 @@ struct CanvasTimelineDataView: View {
             // Check for cancellation before expensive database read
             guard !Task.isCancelled else { return }
 
-            let timelineCards = await self.storageManager.fetchTimelineCards(forDay: dayString)
-            let activities = await self.processTimelineCards(timelineCards, for: timelineDate)
+            let timelineCards = self.storageManager.fetchTimelineCards(forDay: dayString)
+            let activities = self.processTimelineCards(timelineCards, for: timelineDate)
 
             // Check for cancellation before expensive processing
             guard !Task.isCancelled else { return }
@@ -372,9 +376,9 @@ struct CanvasTimelineDataView: View {
             // Mitigation transform: resolve visual overlaps by trimming larger cards
             // so that smaller cards "win". This is a display-only fix to handle
             // upstream card-generation overlap bugs without touching stored data.
-            let segments = await self.resolveOverlapsForDisplay(activities)
+            let segments = self.resolveOverlapsForDisplay(activities)
 
-            let positioned = await segments.map { seg -> CanvasPositionedActivity in
+            let positioned = segments.map { seg -> CanvasPositionedActivity in
                 let y = self.calculateYPosition(for: seg.start)
                 // Card spacing: -2 total (1px top + 1px bottom)
                 let durationMinutes = max(0, seg.end.timeIntervalSince(seg.start) / 60)
@@ -537,7 +541,8 @@ struct CanvasTimelineDataView: View {
                 distractions: card.distractions,
                 videoSummaryURL: card.videoSummaryURL,
                 screenshot: nil,
-                appSites: card.appSites
+                appSites: card.appSites,
+                isBackupGenerated: card.isBackupGenerated
             ))
         }
 
@@ -666,10 +671,6 @@ struct CanvasTimelineDataView: View {
         return CGFloat(totalMinutes) * CanvasConfig.pixelsPerMinute
     }
 
-    private func calculateHeight(for activity: TimelineActivity) -> CGFloat {
-        let durationMinutes = activity.endTime.timeIntervalSince(activity.startTime) / 60
-        return CGFloat(durationMinutes) * CanvasConfig.pixelsPerMinute
-    }
 
     private func formatHour(_ hour: Int) -> String {
         let normalizedHour = hour >= 24 ? hour - 24 : hour
@@ -733,20 +734,6 @@ extension CanvasTimelineDataView {
     }
 }
 
-extension CanvasTimelineDataView {
-    fileprivate func currentHourIndex() -> Int {
-        let cal = Calendar.current
-        let h = cal.component(.hour, from: Date())
-        let idx: Int
-        if h >= CanvasConfig.startHour {
-            idx = h - CanvasConfig.startHour
-        } else {
-            idx = (24 - CanvasConfig.startHour) + h
-        }
-        return max(0, min(idx, (CanvasConfig.endHour - CanvasConfig.startHour) - 1))
-    }
-}
-
 struct CanvasActivityCardStyle {
     let text: Color
     let time: Color
@@ -762,6 +749,7 @@ struct CanvasActivityCard: View {
     let style: CanvasActivityCardStyle
     let isSelected: Bool
     let isSystemCategory: Bool
+    let isBackupGenerated: Bool
     let onTap: () -> Void
     // Raw values for pattern matching (may contain paths)
     let faviconPrimaryRaw: String?
@@ -777,6 +765,22 @@ struct CanvasActivityCard: View {
 
     private var isCompactCard: Bool {
         durationMinutes < 13
+    }
+
+    private var backupIndicator: some View {
+        Text("!")
+            .font(Font.custom("Nunito", size: 9).weight(.semibold))
+            .foregroundColor(Color(red: 0.4, green: 0.4, blue: 0.4))
+            .frame(width: 14, height: 14)
+            .background(
+                Circle()
+                    .fill(Color(red: 0.96, green: 0.94, blue: 0.91).opacity(0.9))
+            )
+            .overlay(
+                Circle()
+                    .stroke(Color(red: 0.9, green: 0.9, blue: 0.9), lineWidth: 0.75)
+            )
+            .help("Generated by backup model")
     }
 
     private var selectionStroke: Color {
@@ -844,14 +848,20 @@ struct CanvasActivityCard: View {
 
                         Spacer()
 
-                        Text(time)
-                            .font(
-                                Font.custom("Nunito", size: 10)
-                                    .weight(.medium)
-                            )
-                            .foregroundColor(style.time)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                        HStack(spacing: 6) {
+                            if isBackupGenerated {
+                                backupIndicator
+                            }
+
+                            Text(time)
+                                .font(
+                                    Font.custom("Nunito", size: 10)
+                                        .weight(.medium)
+                                )
+                                .foregroundColor(style.time)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
                     }
                 }
             }
